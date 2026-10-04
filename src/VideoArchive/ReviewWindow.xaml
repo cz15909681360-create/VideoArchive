@@ -1,0 +1,34 @@
+<Window x:Class="VideoArchive.ReviewWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="决定特殊文件的备份方式 · VideoArchive" Width="1080" Height="760" MinWidth="850" MinHeight="600" WindowStartupLocation="CenterOwner" Background="#F1F5F7">
+  <Border Background="#F1F5F7" Padding="26"><Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <Grid Margin="0,0,0,18"><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+      <Border Background="#FFF0D3" CornerRadius="16" Width="54" Height="54" Margin="0,0,16,0"><TextBlock Text="!" FontSize="29" FontWeight="Bold" Foreground="{StaticResource Amber}" HorizontalAlignment="Center"/></Border>
+      <StackPanel Grid.Column="1"><TextBlock Text="这些文件，需要你决定" FontSize="23" FontWeight="Bold"/><TextBlock Text="时间码无法可靠保留。请勾选文件，再选择原样备份或舍弃时间码后压缩。" Foreground="{StaticResource Muted}" Margin="0,6,0,0"/></StackPanel>
+      <Border Grid.Column="2" Background="#EAE2FA" CornerRadius="12" Padding="16,9"><StackPanel><TextBlock Text="{Binding PendingCount}" FontSize="25" FontWeight="Bold" Foreground="{StaticResource Violet}" HorizontalAlignment="Center"/><TextBlock Text="待决定" Foreground="{StaticResource Violet}" FontSize="11" HorizontalAlignment="Center"/></StackPanel></Border>
+    </Grid>
+    <Grid Grid.Row="1" Margin="0,0,0,14"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="14"/><ColumnDefinition/></Grid.ColumnDefinitions>
+      <Button x:Name="CopyButton" Command="{Binding CopySelectedCommand}" Style="{StaticResource BackupButton}" Padding="18,15" Margin="0">
+        <StackPanel><StackPanel Orientation="Horizontal" HorizontalAlignment="Center"><Path Style="{StaticResource Icon}" Data="{StaticResource ArchiveIcon}" Stroke="White" Margin="0,0,10,0"/><TextBlock Text="原样备份 · 保留全部信息" FontSize="16" FontWeight="Bold"/></StackPanel><TextBlock Text="完整复制所选文件，不重新编码" FontSize="11" Foreground="#D5F2E9" HorizontalAlignment="Center" Margin="0,6,0,0"/></StackPanel>
+      </Button>
+      <Button x:Name="CompressButton" Grid.Column="2" Command="{Binding CompressSelectedCommand}" Style="{StaticResource EncodeButton}" Padding="18,15" Margin="0">
+        <StackPanel><StackPanel Orientation="Horizontal" HorizontalAlignment="Center"><Path Style="{StaticResource Icon}" Data="{StaticResource ScissorIcon}" Stroke="White" Margin="0,0,10,0"/><TextBlock Text="舍弃时间码 · 按方案压缩" FontSize="16" FontWeight="Bold"/></StackPanel><TextBlock Text="移除 tmcd / timecode，保留音轨和字幕" FontSize="11" Foreground="#EAE1FC" HorizontalAlignment="Center" Margin="0,6,0,0"/></StackPanel>
+      </Button>
+    </Grid>
+    <DockPanel Grid.Row="2" Margin="0,0,0,10"><StackPanel Orientation="Horizontal" DockPanel.Dock="Right"><TextBlock Text="{Binding SelectionText}" Foreground="{StaticResource Accent}" FontWeight="SemiBold" Margin="0,0,15,0"/><Button Content="仅勾选待决定" Command="{Binding SelectPendingCommand}" Padding="12,7" Margin="0"/></StackPanel><CheckBox x:Name="SelectAllBox" Content="全选 / 取消全选" IsThreeState="True" IsChecked="{Binding AllSelected, Mode=TwoWay}" FontWeight="SemiBold" Margin="4,0,0,0"/></DockPanel>
+    <DataGrid x:Name="ReviewGrid" Grid.Row="3" ItemsSource="{Binding Rows}" RowHeight="76" EnableRowVirtualization="True" CanUserSortColumns="False">
+      <DataGrid.Columns>
+        <DataGridTemplateColumn Header="选择" Width="48"><DataGridTemplateColumn.CellTemplate><DataTemplate><CheckBox IsChecked="{Binding ReviewSelected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" HorizontalAlignment="Center" Margin="0"/></DataTemplate></DataGridTemplateColumn.CellTemplate></DataGridTemplateColumn>
+        <DataGridTemplateColumn Header="文件 / 原始规格" Width="2*" MinWidth="225"><DataGridTemplateColumn.CellTemplate><DataTemplate><StackPanel><TextBlock Text="{Binding RelativePath}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap" ToolTip="{Binding Source}"/><TextBlock Text="{Binding SourceSpec}" FontSize="11" Foreground="{StaticResource Muted}" Margin="0,6,0,0" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/></StackPanel></DataTemplate></DataGridTemplateColumn.CellTemplate></DataGridTemplateColumn>
+        <DataGridTemplateColumn Header="需要决定的原因" Width="1.7*" MinWidth="185"><DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding ReviewIssue}" FontSize="12" Foreground="#875E1F" ToolTip="{Binding Reason}"/></DataTemplate></DataGridTemplateColumn.CellTemplate></DataGridTemplateColumn>
+        <DataGridTemplateColumn Header="已选择的处理方式" Width="1.45*" MinWidth="160"><DataGridTemplateColumn.CellTemplate><DataTemplate>
+          <Border CornerRadius="8" Padding="10,8" HorizontalAlignment="Left"><Border.Style><Style TargetType="Border"><Setter Property="Background" Value="#FFF0D5"/><Style.Triggers><DataTrigger Binding="{Binding TimecodeChoice}" Value="原样备份"><Setter Property="Background" Value="#E0F3EB"/></DataTrigger><DataTrigger Binding="{Binding TimecodeChoice}" Value="舍弃时间码"><Setter Property="Background" Value="#EDE5FA"/></DataTrigger></Style.Triggers></Style></Border.Style>
+            <TextBlock FontWeight="SemiBold" FontSize="12"><TextBlock.Style><Style TargetType="TextBlock"><Setter Property="Text" Value="● 待决定"/><Setter Property="Foreground" Value="#9A6418"/><Style.Triggers><DataTrigger Binding="{Binding TimecodeChoice}" Value="原样备份"><Setter Property="Text" Value="▣ 原样备份"/><Setter Property="Foreground" Value="#08745F"/></DataTrigger><DataTrigger Binding="{Binding TimecodeChoice}" Value="舍弃时间码"><Setter Property="Text" Value="✂ 舍弃时间码"/><Setter Property="Foreground" Value="#7045AF"/></DataTrigger></Style.Triggers></Style></TextBlock.Style></TextBlock>
+          </Border>
+        </DataTemplate></DataGridTemplateColumn.CellTemplate></DataGridTemplateColumn>
+      </DataGrid.Columns>
+    </DataGrid>
+    <StackPanel Grid.Row="4" Margin="0,16,0,0"><TextBlock Text="{Binding Message}" Foreground="{StaticResource Accent}" FontWeight="SemiBold"/><TextBlock Text="这里只保存处理选择。其他规格保护和成品验证仍会执行；开始备份后才会写入输出，源文件保持不变。" Foreground="{StaticResource Muted}" FontSize="11" Margin="0,7,0,14"/>
+      <DockPanel><Button x:Name="DoneButton" Content="✓  完成选择，返回任务" DockPanel.Dock="Right" Style="{StaticResource Primary}" IsDefault="True" IsEnabled="{Binding AllDecided}" Click="Done_Click" Margin="0"/><Button Content="稍后处理" Click="Later_Click" IsCancel="True" HorizontalAlignment="Left"/><TextBlock Text="全部文件确认后，主界面的开始备份按钮才可用。" Foreground="{StaticResource Muted}" FontSize="11"/></DockPanel>
+    </StackPanel>
+  </Grid></Border>
+</Window>
