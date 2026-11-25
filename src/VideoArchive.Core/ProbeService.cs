@@ -1,10 +1,61 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 
 namespace VideoArchive.Core;
 
 public sealed class ProbeService(string ffprobe)
 {
-    public string CacheIdentity => Files.Normalize(ffprobe) + "|" + new FileInfo(ffprobe).LastWriteTimeUtc.Ticks;
+    static readonly ConcurrentDictionary<string, Lazy<Task<Dictionary<string, (int Depth, string Chroma)>>>> PixelFormats = new();
+    public string CacheIdentity
+    {
+        get
+        {
+            var file = new FileInfo(ffprobe);
+            return file.FullName + "|" + (file.Exists ? file.Length : 0) + "|" + file.LastWriteTimeUtc.Ticks;
+        }
+    }
+    public async Task PrepareAsync(CancellationToken ct)
+    {
+        await GetFormatsAsync(ct);
+    }
+
+    async Task<Dictionary<string, (int Depth, string Chroma)>> GetFormatsAsync(CancellationToken ct)
+    {
+        var tools = CacheIdentity;
+        var load = PixelFormats.GetOrAdd(tools, _ => new(() => LoadFormatsAsync()));
+        try { return await load.Value.WaitAsync(ct); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch
+        {
+            PixelFormats.TryRemove(new KeyValuePair<string, Lazy<Task<Dictionary<string, (int Depth, string Chroma)>>>>(tools, load));
+            throw;
+        }
+    }
+
+    async Task<Dictionary<string, (int Depth, string Chroma)>> LoadFormatsAsync()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var result = await ProcessRunner.RunAsync(ffprobe, ["-v", "error", "-show_pixel_formats", "-of", "json"], timeout.Token);
+        if (result.ExitCode != 0) throw new IOException("读取像素格式说明失败：" + result.Error.Trim());
+        using var document = JsonDocument.Parse(result.Output);
+        var formats = new Dictionary<string, (int Depth, string Chroma)>(StringComparer.Ordinal);
+        foreach (var pixel in document.RootElement.GetProperty("pixel_formats").EnumerateArray())
+        {
+            var components = (int)Num(pixel, "nb_components");
+            var depth = pixel.TryGetProperty("components", out var depths)
+                ? depths.EnumerateArray().Select(component => (int)Num(component, "bit_depth")).DefaultIfEmpty().Max() : 0;
+            string chroma = components < 3 ? components == 1 ? "单通道" : "" : "";
+            if (pixel.TryGetProperty("flags", out var flags) && Num(flags, "rgb") == 1) chroma = "RGB";
+            else if (components >= 3 && pixel.TryGetProperty("log2_chroma_w", out _) && pixel.TryGetProperty("log2_chroma_h", out _))
+                chroma = ((int)Num(pixel, "log2_chroma_w"), (int)Num(pixel, "log2_chroma_h")) switch
+                {
+                    (1, 1) => "4:2:0", (1, 0) => "4:2:2", (0, 0) => "4:4:4",
+                    (0, 1) => "4:4:0", (2, 0) => "4:1:1", (2, 2) => "4:1:0", _ => ""
+                };
+            formats[Text(pixel, "name")] = (depth, chroma);
+        }
+        return formats;
+    }
     public int ProcessCount => Volatile.Read(ref processCount);
     int processCount;
     Task<ProcessResult> Run(IEnumerable<string> args, CancellationToken ct, Action<string>? line = null)
@@ -62,7 +113,9 @@ public sealed class ProbeService(string ffprobe)
             info.Width = (int)Num(s, "width"); info.Height = (int)Num(s, "height");
             info.PixelFormat = Text(s, "pix_fmt"); info.SampleAspectRatio = Text(s, "sample_aspect_ratio");
             var rawDepth = (int)Num(s, "bits_per_raw_sample");
-            info.BitDepth = rawDepth > 0 ? rawDepth : info.PixelFormat.Contains("12") ? 12 : info.PixelFormat.Contains("10") || info.PixelFormat.Contains("p010") ? 10 : 8;
+            var formatDetails = (await GetFormatsAsync(ct)).GetValueOrDefault(info.PixelFormat);
+            info.BitDepth = rawDepth > 0 ? rawDepth : formatDetails.Depth;
+            info.Chroma = formatDetails.Chroma ?? "";
             info.Fps = ProcessRunner.Rational(Text(s, "avg_frame_rate"));
             info.NominalFps = ProcessRunner.Rational(Text(s, "r_frame_rate"));
             info.TimeBase = ProcessRunner.Rational(Text(s, "time_base"));

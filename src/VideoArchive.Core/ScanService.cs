@@ -11,7 +11,7 @@ public sealed class ScanService(ProbeService probe, Func<EncodeSettings, int, bo
     public TimeSpan LastScanTime { get; private set; }
     sealed class ProbeCache
     {
-        public int Version { get; set; } = 2;
+        public int Version { get; set; } = 3;
         public string Tool { get; set; } = "";
         public Dictionary<string, MediaInfo> Entries { get; set; } = [];
     }
@@ -20,16 +20,23 @@ public sealed class ScanService(ProbeService probe, Func<EncodeSettings, int, bo
         try
         {
             var stored = path == null ? null : JsonStore.Read<ProbeCache>(path);
-            if (stored?.Version == 2 && stored.Tool == tool) return new(stored.Entries, StringComparer.OrdinalIgnoreCase);
+            if (stored?.Version == 3 && stored.Tool == tool) return new(stored.Entries, StringComparer.OrdinalIgnoreCase);
         }
         catch (Exception ex) when (ex is IOException or System.Text.Json.JsonException or UnauthorizedAccessException) { }
         return new(StringComparer.OrdinalIgnoreCase);
     }
-    public async Task<ArchiveJob> ScanAsync(string source, string output, EncodeSettings settings, Action<string>? message, CancellationToken ct)
+    public static bool RequiresCadenceRescan(ArchiveJob? job, EncodeSettings settings) =>
+        job is { State: "已扫描", Settings.LimitFps: false } && settings.LimitFps &&
+        job.Items.Any(item => item.Media is { CadenceChecked: false });
+
+    public async Task<ArchiveJob> ScanAsync(string source, string output, EncodeSettings settings, Action<string>? message, CancellationToken ct, ArchiveJob? previousJob = null)
     {
         settings.Validate(); Files.ValidateRoots(source, output);
         var watch = Stopwatch.StartNew();
         var job = new ArchiveJob { SourceRoot = Files.Normalize(source), OutputRoot = Files.Normalize(output), Settings = settings.Snapshot(), PlanVersion = MediaPolicy.PlanVersion };
+        var previousChoices = previousJob?.SourceRoot.Equals(job.SourceRoot, StringComparison.OrdinalIgnoreCase) == true
+            ? previousJob.Items.Where(item => item.TimecodeChoice.Length > 0).ToDictionary(item => item.Source, StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, PlanItem>(StringComparer.OrdinalIgnoreCase);
         var files = new List<FileInfo>();
         var engine = new DecisionEngine(); var stack = new Stack<string>(); stack.Push(job.SourceRoot);
         while (stack.Count > 0)
@@ -56,7 +63,7 @@ public sealed class ScanService(ProbeService probe, Func<EncodeSettings, int, bo
             }
         }
         var items = new ConcurrentBag<PlanItem>(job.Items);
-        int completed = 0, hits = 0; var progressLock = new object(); long lastUpdate = -200;
+        int completed = 0, hits = 0, dirty = 0; var progressLock = new object(); long lastUpdate = -200;
         try
         {
             await Parallel.ForEachAsync(files, new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(scanParallelism, 1, 8), CancellationToken = ct }, async (f, token) =>
@@ -71,15 +78,18 @@ public sealed class ScanService(ProbeService probe, Func<EncodeSettings, int, bo
                         { media = previous; Interlocked.Increment(ref hits); }
                         else
                         {
-                            try { media = await probe.ProbeAsync(entry, settings.LimitFps, token); cache[entry] = media; }
+                            try { media = await probe.ProbeAsync(entry, settings.LimitFps, token); cache[entry] = media; Interlocked.Exchange(ref dirty, 1); }
                             catch (Exception ex) when (ex is IOException or System.Text.Json.JsonException) { warning = "媒体探测失败，原样保留：" + ex.Message; }
                         }
                     }
-                    var item = engine.Create(job.SourceRoot, job.OutputRoot, entry, f.Length, f.LastWriteTimeUtc, media, settings);
+                    var choice = previousChoices.TryGetValue(entry, out var earlier) && earlier.SourceSize == f.Length && earlier.SourceModifiedUtc == f.LastWriteTimeUtc
+                        ? earlier.TimecodeChoice : "";
+                    var item = engine.Create(job.SourceRoot, job.OutputRoot, entry, f.Length, f.LastWriteTimeUtc, media, settings, choice);
                     item.VideoCandidate = VideoExtensions.Contains(f.Extension);
                     if (warning != null) item.Reason = warning;
                     ProtectDepth(item, settings);
                     if (File.Exists(item.Destination) && settings.Collision == "跳过") { item.Action = "跳过"; item.EstimatedSize = 0; item.Reason = "输出已存在，按规则跳过"; }
+                    item.PlannedAction = item.Action;
                     items.Add(item);
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -95,9 +105,9 @@ public sealed class ScanService(ProbeService probe, Func<EncodeSettings, int, bo
         finally
         {
             LastCacheHits = hits;
-            if (cachePath != null)
+            if (cachePath != null && dirty != 0)
             {
-                try { JsonStore.Write(cachePath, new ProbeCache { Tool = probe.CacheIdentity, Entries = cache.Take(20000).ToDictionary(p => p.Key, p => p.Value, StringComparer.OrdinalIgnoreCase) }); }
+                try { JsonStore.Write(cachePath, new ProbeCache { Tool = probe.CacheIdentity, Entries = cache.OrderByDescending(entry => Files.Contains(job.SourceRoot, entry.Key)).ThenByDescending(entry => entry.Value.ModifiedUtc).Take(20000).ToDictionary(p => p.Key, p => p.Value, StringComparer.OrdinalIgnoreCase) }); }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { job.Notices.Add("探测缓存未保存：" + ex.Message); }
             }
             LastScanTime = watch.Elapsed;
@@ -108,6 +118,7 @@ public sealed class ScanService(ProbeService probe, Func<EncodeSettings, int, bo
     public void Replan(ArchiveJob job, EncodeSettings settings)
     {
         if (job.PlanVersion != MediaPolicy.PlanVersion) throw new InvalidOperationException("旧任务的探测信息需要更新，请重新扫描以使用新的数据轨规则。");
+        if (RequiresCadenceRescan(job, settings)) throw new InvalidOperationException("开启限帧后需要重新扫描，以检测峰值帧率。");
         settings.Validate(); var engine = new DecisionEngine(); job.Settings = settings.Snapshot();
         job.Items = job.Items.Select(p =>
         {
@@ -118,6 +129,7 @@ public sealed class ScanService(ProbeService probe, Func<EncodeSettings, int, bo
             ProtectDepth(n, settings);
             if (p.Media == null && p.Reason.StartsWith("媒体探测失败")) n.Reason = p.Reason;
             if (File.Exists(n.Destination) && settings.Collision == "跳过") { n.Action = "跳过"; n.EstimatedSize = 0; n.Reason = "输出已存在，按规则跳过"; }
+            n.PlannedAction = n.Action;
             return n;
         }).ToList();
     }

@@ -1,5 +1,5 @@
 <Window x:Class="VideoArchive.ReviewWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="决定特殊文件的备份方式 · VideoArchive" Width="1080" Height="760" MinWidth="850" MinHeight="600" WindowStartupLocation="CenterOwner" Background="#F1F5F7">
+        Title="决定特殊文件的备份方式 · VideoArchive" Icon="App.ico" Width="1080" Height="760" MinWidth="850" MinHeight="600" WindowStartupLocation="CenterOwner" Background="#F1F5F7">
   <Border Background="#F1F5F7" Padding="26"><Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
     <Grid Margin="0,0,0,18"><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
       <Border Background="#FFF0D3" CornerRadius="16" Width="54" Height="54" Margin="0,0,16,0"><TextBlock Text="!" FontSize="29" FontWeight="Bold" Foreground="{StaticResource Amber}" HorizontalAlignment="Center"/></Border>

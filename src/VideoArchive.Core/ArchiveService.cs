@@ -1,21 +1,45 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 
 namespace VideoArchive.Core;
 
-public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDirectory, Func<string, long>? availableSpace = null)
+public sealed record ArchiveExecution(bool OverlapVerification = false, bool NvidiaDecode = false);
+
+public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDirectory, Func<string, long>? availableSpace = null, ArchiveExecution? execution = null)
 {
     readonly object persistenceLock = new(), nameLock = new();
     readonly HashSet<string> reservedNames = new(StringComparer.OrdinalIgnoreCase);
     TaskCompletionSource<bool> pauseGate = NewGate(true);
     public bool Paused { get; private set; }
     public event Action<PlanItem?, string>? Changed;
+    public event Action<string, TimeSpan>? StageTimed;
+    readonly ProbeService outputProbe = new(ffprobe);
     static TaskCompletionSource<bool> NewGate(bool completed)
     { var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously); if (completed) gate.SetResult(true); return gate; }
     public void Pause() { lock (nameLock) { if (Paused) return; Paused = true; pauseGate = NewGate(false); } Changed?.Invoke(null, "已请求暂停，当前文件完成后暂停队列"); }
     public void Continue() { lock (nameLock) { Paused = false; pauseGate.TrySetResult(true); } Changed?.Invoke(null, "继续处理"); }
+    async Task WaitForEncoderAsync(SemaphoreSlim encoders, CancellationToken ct)
+    {
+        while (true)
+        {
+            await pauseGate.Task.WaitAsync(ct);
+            await encoders.WaitAsync(ct);
+            lock (nameLock)
+            {
+                if (!Paused) return;
+                encoders.Release();
+            }
+        }
+    }
+
     public string JobPath(ArchiveJob job) => Path.Combine(dataDirectory, "jobs", job.Id + ".json");
-    public void Save(ArchiveJob job) { lock (persistenceLock) JsonStore.Write(JobPath(job), job); }
+    public void Save(ArchiveJob job)
+    {
+        long started = Stopwatch.GetTimestamp();
+        lock (persistenceLock) JsonStore.Write(JobPath(job), job);
+        StageTimed?.Invoke("history", Stopwatch.GetElapsedTime(started));
+    }
     public async Task RunAsync(ArchiveJob job, CancellationToken ct)
     {
         job.Settings.Validate(); Files.ValidateRoots(job.SourceRoot, job.OutputRoot);
@@ -30,6 +54,8 @@ public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDir
         }
         var candidates = job.Items.Where(i => i.Action != "未处理").ToList();
         var index = -1;
+        using var encoders = execution?.OverlapVerification == true ? new SemaphoreSlim(1) : null;
+        using var verification = execution?.OverlapVerification == true ? new SemaphoreSlim(1) : null;
         async Task Worker()
         {
             while (!ct.IsCancellationRequested)
@@ -50,7 +76,7 @@ public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDir
                         { Changed?.Invoke(p, "已验证之前完成的文件"); continue; }
                         p.Status = "待处理"; p.Detail = "之前输出缺失或已变化，重新处理";
                     }
-                    await ProcessItem(job, p, ct);
+                    await ProcessItem(job, p, encoders, verification, ct);
                 }
                 catch (OperationCanceledException) { p.Status = "已取消"; p.Progress = 0; throw; }
                 catch (Exception ex) { p.Status = "失败"; p.Detail = ex.Message; p.Progress = 0; }
@@ -59,14 +85,14 @@ public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDir
         }
         try
         {
-            await Task.WhenAll(Enumerable.Range(0, job.Settings.Parallel).Select(_ => Worker()));
+            await Task.WhenAll(Enumerable.Range(0, encoders is null ? job.Settings.Parallel : 2).Select(_ => Worker()));
             ct.ThrowIfCancellationRequested();
             job.State = job.Items.Any(i => i.Status == "失败") ? "完成（有失败）" : "完成";
         }
         catch (OperationCanceledException) { job.State = "已取消，可恢复"; }
         finally { job.Finished = DateTime.Now; Continue(); Save(job); Changed?.Invoke(null, job.State); }
     }
-    async Task ProcessItem(ArchiveJob job, PlanItem p, CancellationToken ct)
+    async Task ProcessItem(ArchiveJob job, PlanItem p, SemaphoreSlim? encoders, SemaphoreSlim? verification, CancellationToken ct)
     {
         if (p.Action == "跳过") { p.Status = "已跳过"; p.Progress = 100; return; }
         Files.CheckDestination(job.SourceRoot, p.Source);
@@ -93,27 +119,55 @@ public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDir
         var free = (availableSpace ?? Files.FreeSpace)(p.Destination);
         if (free < necessary + 16 * 1024 * 1024) throw new IOException("输出磁盘可用空间不足。");
         var temp = Path.Combine(Path.GetDirectoryName(p.Destination)!, ".va-" + Guid.NewGuid().ToString("N") + ".partial" + Path.GetExtension(p.Destination));
-        p.Status = p.Action == "压缩" ? "压缩中" : "复制中"; p.Detail = ""; Changed?.Invoke(p, p.Status);
+        p.Detail = "";
+        p.PlannedAction = p.PlannedAction.Length == 0 ? p.Action : p.PlannedAction;
+        VideoSpecification? verified = null;
+        bool verifySlotHeld = false;
         try
         {
             if (p.Action == "压缩")
             {
-                var args = CommandBuilder.Build(p, job.Settings, temp);
-                p.Log = CommandBuilder.Preview(p, job.Settings, ffmpeg) + Environment.NewLine;
-                var progressOut = new Dictionary<string, string>();
-                var encoded = await ProcessRunner.RunAsync(ffmpeg, args, ct, line =>
+                var tryHardware = (execution?.NvidiaDecode ?? job.Settings.NvidiaDecode) && CommandBuilder.CanDecodeOnNvidia(p, job.Settings);
+                p.Log = "";
+                var validation = await EncodeAndVerify(tryHardware);
+                if (tryHardware && (validation != null || new FileInfo(temp).Length > p.SourceSize))
                 {
-                    var key = line.Split('=', 2); if (key.Length != 2) return; progressOut[key[0]] = key[1];
-                    if (key[0] != "progress") return;
-                    if (progressOut.TryGetValue("out_time_us", out var us)) p.Progress = Math.Clamp(ProcessRunner.Number(us) / 1_000_000 / p.Media!.Duration * 90, 0, 90);
-                    p.Detail = $"{progressOut.GetValueOrDefault("fps", "—")} fps · {progressOut.GetValueOrDefault("speed", "—")}";
-                    Changed?.Invoke(p, p.Detail);
-                });
-                p.Log += encoded.Error;
-                if (encoded.ExitCode != 0) throw new IOException("编码失败：" + LastMessage(encoded.Error));
-                if (!p.DropTimecode) MediaPolicy.RestoreTimecodeDescriptions(temp, p.Media!);
-                p.Status = "验证中"; p.Detail = "检查规格、轨道和完整解码"; Changed?.Invoke(p, p.Detail);
-                var validation = await VerifyAsync(p, temp, job.Settings, ct);
+                    if (File.Exists(temp)) File.Delete(temp);
+                    if (verifySlotHeld) { verification!.Release(); verifySlotHeld = false; }
+                    p.Log += "同卡硬解未通过，使用软件解码重试：" + (validation ?? "成品大于原文件") + Environment.NewLine;
+                    validation = await EncodeAndVerify(false);
+                }
+
+                async Task<string?> EncodeAndVerify(bool hardware)
+                {
+                    if (encoders != null) await WaitForEncoderAsync(encoders, ct);
+                    try
+                    {
+                        p.Status = "压缩中"; p.Detail = hardware ? "NVIDIA 同卡解码" : ""; Changed?.Invoke(p, p.Status);
+                        var error = await EncodeAsync(job, p, temp, hardware, ct);
+                        if (error != null)
+                        {
+                            if (hardware) return error;
+                            throw new IOException("编码失败：" + error);
+                        }
+                    }
+                    finally { encoders?.Release(); }
+                    if (verification != null)
+                    {
+                        p.Status = "等待验证"; Changed?.Invoke(p, p.Status);
+                        await verification.WaitAsync(ct);
+                        verifySlotHeld = true;
+                    }
+                    if (!p.DropTimecode) MediaPolicy.RestoreTimecodeDescriptions(temp, p.Media!);
+                    p.Status = "验证中"; p.Detail = "检查规格、轨道和完整解码"; Changed?.Invoke(p, p.Detail);
+                    try
+                    {
+                        var result = await VerifyDetailsAsync(p, temp, job.Settings, ct);
+                        verified = result.Spec;
+                        return result.Error;
+                    }
+                    catch (IOException ex) when (hardware) { return ex.Message; }
+                }
                 if (validation != null || new FileInfo(temp).Length > p.SourceSize)
                 {
                     File.Delete(temp); sourceLock.Position = 0;
@@ -125,6 +179,7 @@ public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDir
             }
             else await CopyAsync(sourceLock, temp, p, ct);
             ct.ThrowIfCancellationRequested();
+            var hashStart = Stopwatch.GetTimestamp();
             p.OutputSize = new FileInfo(temp).Length; p.OutputSha256 = await Files.HashAsync(temp, ct);
             // Verify copies against a source hash while the source remains locked against writes.
             if (p.Action == "复制")
@@ -132,12 +187,42 @@ public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDir
                 sourceLock.Position = 0; var sourceHash = Convert.ToHexString(await SHA256.HashDataAsync(sourceLock, ct));
                 if (p.OutputSize != p.SourceSize || sourceHash != p.OutputSha256) throw new IOException("复制文件 SHA-256 校验失败。");
             }
+            StageTimed?.Invoke("hash", Stopwatch.GetElapsedTime(hashStart));
             Files.RestoreTimes(temp, source.CreationTimeUtc, source.LastWriteTimeUtc);
             Files.CheckDestination(job.OutputRoot, p.Destination);
             File.Move(temp, p.Destination, job.Settings.Collision == "覆盖");
+            p.VerifiedVideo = p.Action == "压缩" ? verified : p.Media is { } media ? VideoSpecification.FromMedia(media) : null;
+            if (p.Action == "压缩") p.Detail = "规格、轨道与完整解码均通过";
+            else if (!p.Detail.StartsWith("改为原样保留")) p.Detail = "SHA-256 校验通过";
             p.Status = "完成"; p.Progress = 100;
         }
-        finally { if (File.Exists(temp)) File.Delete(temp); }
+        finally
+        {
+            if (verifySlotHeld) verification!.Release();
+            if (File.Exists(temp)) File.Delete(temp);
+        }
+    }
+
+    async Task<string?> EncodeAsync(ArchiveJob job, PlanItem item, string temp, bool hardware, CancellationToken ct)
+    {
+        long started = Stopwatch.GetTimestamp();
+        var args = CommandBuilder.Build(item, job.Settings, temp, hardware, job.AutomaticNvidiaPreset);
+        item.Log += ffmpeg + " " + string.Join(" ", args.Select(arg => "\"" + arg + "\"")) + Environment.NewLine;
+        var progress = new Dictionary<string, string>();
+        var encoded = await ProcessRunner.RunAsync(ffmpeg, args, ct, line =>
+        {
+            var key = line.Split('=', 2);
+            if (key.Length != 2) return;
+            progress[key[0]] = key[1];
+            if (key[0] != "progress") return;
+            if (progress.TryGetValue("out_time_us", out var elapsed))
+                item.Progress = Math.Clamp(ProcessRunner.Number(elapsed) / 1_000_000 / item.Media!.Duration * 90, 0, 90);
+            item.Detail = $"{progress.GetValueOrDefault("fps", "—")} fps · {progress.GetValueOrDefault("speed", "—")}";
+            Changed?.Invoke(item, item.Detail);
+        });
+        StageTimed?.Invoke("encode", Stopwatch.GetElapsedTime(started));
+        item.Log += encoded.Error;
+        return encoded.ExitCode == 0 ? null : LastMessage(encoded.Error);
     }
     async Task CopyAsync(FileStream source, string temp, PlanItem p, CancellationToken ct)
     {
@@ -152,19 +237,37 @@ public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDir
         }
         await output.FlushAsync(ct);
     }
-    public async Task<string?> VerifyAsync(PlanItem item, string output, EncodeSettings settings, CancellationToken ct)
+    public async Task<string?> VerifyAsync(PlanItem item, string output, EncodeSettings settings, CancellationToken ct) =>
+        (await VerifyDetailsAsync(item, output, settings, ct)).Error;
+
+    async Task<(string? Error, VideoSpecification? Spec)> VerifyDetailsAsync(PlanItem item, string output, EncodeSettings settings, CancellationToken ct)
     {
         var source = item.Media!;
         settings = MediaPolicy.EffectiveSettings(item, settings);
-        var actual = await new ProbeService(ffprobe).ProbeAsync(output, item.DropFrames, ct);
+        long started = Stopwatch.GetTimestamp();
+        var actual = await outputProbe.ProbeAsync(output, settings.LimitFps, ct);
+        StageTimed?.Invoke("probe", Stopwatch.GetElapsedTime(started));
+        string? error = ValidateOutput(item, settings, source, actual);
+        if (error != null) return (error, null);
+
+        started = Stopwatch.GetTimestamp();
+        var decode = await ProcessRunner.RunAsync(ffmpeg, ["-v", "error", "-xerror", "-i", output, "-map", "0:v", "-map", "0:a?", "-f", "null", "-"], ct);
+        StageTimed?.Invoke("fullDecode", Stopwatch.GetElapsedTime(started));
+        if (decode.ExitCode != 0 || !string.IsNullOrWhiteSpace(decode.Error)) throw new IOException("成品解码校验失败：" + LastMessage(decode.Error));
+        return (null, VideoSpecification.FromMedia(actual));
+    }
+
+    static string? ValidateOutput(PlanItem item, EncodeSettings settings, MediaInfo source, MediaInfo actual)
+    {
         if (actual.Width != item.TargetWidth || actual.Height != item.TargetHeight) return "输出尺寸不符";
         if (actual.Codec != (settings.Codec == "H.264" ? "h264" : settings.Codec == "HEVC" ? "hevc" : "av1")) return "输出编码不符";
         if ((!item.ConvertToTenBit420 && actual.BitDepth < source.BitDepth) || actual.BitDepth != item.TargetDepth) return "输出位深不符";
+        if (actual.Chroma != "4:2:0") return "输出色度采样不符";
         if (item.ConvertToTenBit420 && actual.PixelFormat != "yuv420p10le") return "输出未转换为10-bit 4:2:0";
         var actualProfile = actual.Streams.Single(s => s.Index == actual.VideoIndex).Profile.Replace(" ", "").ToLowerInvariant();
         if (actualProfile != MediaPolicy.ResolveProfile(settings, item.TargetDepth)) return "输出Profile未按编码和位深适配";
         if (Math.Abs(actual.Duration - source.Duration) > Math.Max(.25, 2 / source.Fps)) return "输出时长不符";
-        if (!item.DropFrames && Math.Abs(actual.Fps - source.Fps) > .1 || item.DropFrames && actual.MaxFps > settings.FpsLimit * 1.005 + .02) return "输出帧率不符";
+        if (!item.DropFrames && Math.Abs(actual.Fps - source.Fps) > .1 || settings.LimitFps && (!actual.CadenceChecked || actual.MaxFps > settings.FpsLimit * 1.005 + .02)) return "输出帧率不符";
         if (source.VideoMbps > 0 && actual.VideoMbps > source.VideoMbps + .000001) return "输出平均码率高于源视频";
         if (Math.Abs(actual.Rotation - source.Rotation) % 360 != 0) return "旋转信息未保留";
         var expected = MediaPolicy.MappedStreams(source, item.DropTimecode);
@@ -194,8 +297,6 @@ public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDir
             if (actual.ColorPrimaries != source.ColorPrimaries || actual.ColorTransfer != source.ColorTransfer || actual.ColorSpace != source.ColorSpace || actual.ColorRange != source.ColorRange) return "HDR色彩信息未可靠保留";
             if (source.HdrMetadata.Any(s => !actual.HdrMetadata.Contains(s))) return "HDR必要元数据未可靠保留";
         }
-        var decode = await ProcessRunner.RunAsync(ffmpeg, ["-v", "error", "-xerror", "-i", output, "-map", "0:v", "-map", "0:a?", "-f", "null", "-"], ct);
-        if (decode.ExitCode != 0 || !string.IsNullOrWhiteSpace(decode.Error)) throw new IOException("成品解码校验失败：" + LastMessage(decode.Error));
         return null;
     }
     static bool ImportantTag(string key) => key.ToLowerInvariant() is not ("encoder" or "major_brand" or "minor_version" or "compatible_brands" or "handler_name" or "vendor_id" or "duration" or "bps" or "number_of_frames" or "number_of_bytes" or "_statistics_writing_app" or "_statistics_writing_date_utc" or "_statistics_tags");

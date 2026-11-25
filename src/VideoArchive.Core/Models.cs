@@ -16,7 +16,7 @@ public sealed class EncodeSettings : Observable
 {
     string backend = "CPU", codec = "HEVC", rateMode = "VBR", bitrateMode = "智能推荐", profile = "自动", depth = "随源", encoderPreset = "自动", audio = "原样保留", collision = "跳过";
     double quality = 1, fixedMbps = 20, maxMultiplier = 1.5, tolerance = 10, minSavings = 15, cq = 22, fpsLimit = 60;
-    bool limit1080, limitFps, unified, aq = true, lookAhead;
+    bool limit1080, limitFps, unified, aq = true, lookAhead, nvidiaDecode;
     int audioKbps = 320, parallel = 1;
     public string Backend { get => backend; set => Set(ref backend, value); }
     public string Codec { get => codec; set => Set(ref codec, value); }
@@ -39,19 +39,20 @@ public sealed class EncodeSettings : Observable
     public bool Unified { get => unified; set => Set(ref unified, value); }
     public bool Aq { get => aq; set => Set(ref aq, value); }
     public bool LookAhead { get => lookAhead; set => Set(ref lookAhead, value); }
+    public bool NvidiaDecode { get => nvidiaDecode; set => Set(ref nvidiaDecode, value); }
     public int AudioKbps { get => audioKbps; set => Set(ref audioKbps, value); }
     public int Parallel { get => parallel; set => Set(ref parallel, value); }
     public EncodeSettings Snapshot() => JsonStore.Clone(this);
     public void Validate()
     {
         if (Backend is not ("CPU" or "NVIDIA" or "Intel" or "AMD") || Codec is not ("H.264" or "HEVC" or "AV1") || RateMode is not ("VBR" or "CBR" or "恒定质量") || BitrateMode is not ("智能推荐" or "固定上限") || Depth is not ("随源" or "8-bit" or "10-bit") || Audio is not ("原样保留" or "AAC转码") || Collision is not ("跳过" or "覆盖" or "自动重命名")) throw new InvalidOperationException("设置中包含未知选项，请重新选择参数。");
-        if (!double.IsFinite(FixedMbps) || FixedMbps <= 0 || !double.IsFinite(Quality) || Quality <= 0 ||
-            !double.IsFinite(MaxMultiplier) || MaxMultiplier < 1 || !double.IsFinite(FpsLimit) || FpsLimit <= 0 ||
+        if (BitrateMode == "固定上限" && (!double.IsFinite(FixedMbps) || FixedMbps <= 0) || BitrateMode == "智能推荐" && (!double.IsFinite(Quality) || Quality <= 0) ||
+            !double.IsFinite(MaxMultiplier) || MaxMultiplier < 1 || LimitFps && (!double.IsFinite(FpsLimit) || FpsLimit <= 0) ||
             !double.IsFinite(Tolerance) || Tolerance < 0 || Tolerance > 100 || !double.IsFinite(MinSavings) || MinSavings < 0 || MinSavings >= 100 ||
             !double.IsFinite(Cq) || Cq < 0 || Cq > (Codec == "AV1" && Backend == "CPU" ? 63 : 51) || Parallel < 1 || Parallel > 8 || AudioKbps < 32 || AudioKbps > 1024)
             throw new InvalidOperationException("参数无效：请检查码率、质量值、帧率、容差、收益、音频码率和并行数（1–8）。");
     }
-    [JsonIgnore] public string Summary => $"{Codec} · {Backend} · {Depth} · {RateMode} · {(BitrateMode == "智能推荐" ? $"智能 ×{Quality:0.##}" : $"≤ {FixedMbps:0.##} Mbps")} · {(Limit1080 ? "最高1080P" : "原尺寸")} · {(LimitFps ? $"最高{FpsLimit:0.###} fps" : "原帧率")} · 音频{Audio}";
+    [JsonIgnore] public string Summary => $"{Codec} · {Backend} · {Depth} · {RateMode} · {(BitrateMode == "智能推荐" ? $"智能 ×{Quality:0.##}" : $"目标 {FixedMbps:0.##} Mbps")} · {(Limit1080 ? "最高1080P" : "原尺寸")} · {(LimitFps ? $"最高{FpsLimit:0.###} fps" : "原帧率")} · 音频{Audio}";
 }
 
 public sealed class MediaStream
@@ -103,8 +104,24 @@ public sealed class MediaInfo
     public List<MediaStream> Streams { get; set; } = [];
     public Dictionary<string, string> Tags { get; set; } = [];
     public int Chapters { get; set; }
+    public string Chroma { get; set; } = "";
     [JsonIgnore] public bool Hdr => ColorTransfer is "smpte2084" or "arib-std-b67";
     [JsonIgnore] public string Spec => $"{Width}×{Height} · {Fps:0.###}fps{(Vfr ? " VFR" : "")} · {Codec.ToUpperInvariant()} · {(VideoMbps > 0 ? $"{VideoMbps:0.##}M" : "码率未知")}{(Hdr ? " · HDR" : "")}";
+}
+
+public sealed record VideoSpecification(int Width, int Height, string Codec, int BitDepth, string Chroma, double Mbps, double Fps, double Duration, bool Vfr = false)
+{
+    public static VideoSpecification FromMedia(MediaInfo media) =>
+        new(media.Width, media.Height, media.Codec, media.BitDepth, media.Chroma, media.VideoMbps, media.Fps, media.Duration, media.Vfr);
+
+    public string Describe(string? frameRate = null)
+    {
+        var depth = BitDepth > 0 ? $"{BitDepth}-bit" : "位深未知";
+        var sampling = Chroma.Length > 0 ? Chroma : "色度未知";
+        var rate = frameRate ?? (Fps > 0 ? $"{Fps:0.###} fps{(Vfr ? " VFR" : "")}" : "帧率未知");
+        var bitrate = Mbps > 0 ? $"{Mbps:0.##} Mbps" : "码率未知";
+        return $"{Width}×{Height} · {Codec.ToUpperInvariant()} · {depth} {sampling} · {bitrate} · {rate} · {(Duration > 0 ? Format.Time(Duration) : "时长未知")}";
+    }
 }
 
 public sealed class PlanItem : Observable
@@ -134,6 +151,10 @@ public sealed class PlanItem : Observable
     public bool ConvertToTenBit420 { get; set; }
     public double TargetFps { get; set; }
     public bool DropFrames { get; set; }
+    public double? PlannedFpsLimit { get; set; }
+    public string PlannedRateMode { get; set; } = "";
+    public string PlannedAction { get; set; } = "";
+    public VideoSpecification? VerifiedVideo { get; set; }
     public double TargetMbps { get; set; }
     public double PeakMbps { get; set; }
     public bool Estimated { get; set; }
@@ -142,16 +163,36 @@ public sealed class PlanItem : Observable
     public long OutputSize { get; set; }
     public string Log { get; set; } = "";
     string status = "待处理", detail = ""; double progress;
-    public string Status { get => status; set { Set(ref status, value); Raise(nameof(DisplayStatus)); } }
+    public string Status { get => status; set { Set(ref status, value); Raise(nameof(DisplayStatus)); Raise(nameof(OutputSpec)); Raise(nameof(OutputSizeText)); } }
     public string Detail { get => detail; set { Set(ref detail, value); Raise(nameof(DisplayStatus)); } }
     public double Progress { get => progress; set => Set(ref progress, value); }
-    [JsonIgnore] public string SourceSpec => Media?.Spec ?? (VideoCandidate ? "无法探测的视频" : "配套文件");
-    [JsonIgnore] public string TargetSpec => Action is "压缩" or "待决定" ? $"{TargetWidth}×{TargetHeight} · {(DropFrames ? $"≤{TargetFps:0.###}" : $"{TargetFps:0.###}")}fps · {TargetMbps:0.##}M · {TargetCodec} {TargetProfile}{(ConvertToTenBit420 ? " · 10-bit 4:2:0" : "")}{(Estimated ? "（估算）" : "")}{(RequiresReview ? "（待确认）" : "")}" : Action == "复制" ? "原样保留" : "—";
+    [JsonIgnore] public string SourceSpec => ((Media is { } media) ? VideoSpecification.FromMedia(media).Describe() : null) ?? (VideoCandidate ? "无法探测的视频" : "配套文件");
+    [JsonIgnore] public string TargetSpec
+    {
+        get
+        {
+            var action = PlannedAction.Length == 0 ? Action : PlannedAction;
+            if (action == "复制") return Media is null ? "原样保留" : "原样保留 · " + SourceSpec;
+            if (action is not ("压缩" or "待决定")) return "—";
+            var spec = new VideoSpecification(TargetWidth, TargetHeight, TargetCodec + " " + TargetProfile,
+                TargetDepth, "4:2:0", TargetMbps, TargetFps, Media?.Duration ?? 0, Media?.Vfr ?? false);
+            var fpsText = DropFrames ? PlannedFpsLimit is { } cap ? $"峰值 ≤ {cap:0.###} fps" : "计划限帧" : null;
+            var label = PlannedRateMode == "恒定质量" ? "计划 · 参考码率" : "计划 · 目标平均码率";
+            return $"{label} · {spec.Describe(fpsText)}{(RequiresReview ? "（待确认）" : "")}";
+        }
+    }
+    [JsonIgnore] public string OutputSpec => Status != "完成" ? TargetSpec
+        : VerifiedVideo is { } result ? "已验证 · " + result.Describe()
+        : Action == "复制" && Media != null ? "已验证 · " + SourceSpec
+        : VideoCandidate || Media != null ? "成品规格未记录" : "已验证 · 原样保留";
+    [JsonIgnore] public bool PendingCompression => Action == "压缩" && Status is "待处理" or "已取消";
+    [JsonIgnore] public string OutputSizeText => Status == "完成" ? Format.Bytes(OutputSize)
+        : Status == "已跳过" || Action is "跳过" or "未处理" ? "—" : "预计 " + EstimateText;
     [JsonIgnore] public string EstimateText => Format.Bytes(EstimatedSize);
     [JsonIgnore] public string DisplayStatus => string.IsNullOrEmpty(Detail) ? Status : $"{Status} · {Detail}";
 }
 
-public sealed class ArchiveJob
+public sealed class ArchiveJob : IJsonOnDeserializing
 {
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
     public DateTime Started { get; set; } = DateTime.Now;
@@ -160,10 +201,15 @@ public sealed class ArchiveJob
     public string OutputRoot { get; set; } = "";
     public string State { get; set; } = "已扫描";
     public int PlanVersion { get; set; }
+    public string AutomaticNvidiaPreset { get; set; } = CommandBuilder.DefaultNvidiaPreset;
     public EncodeSettings Settings { get; set; } = new();
     public List<PlanItem> Items { get; set; } = [];
     public List<string> Directories { get; set; } = [];
     public List<string> Notices { get; set; } = [];
+
+    // Jobs saved before the default changed omitted this value and used P6.
+    void IJsonOnDeserializing.OnDeserializing() => AutomaticNvidiaPreset = "p6";
+
     [JsonIgnore] public long SourceBytes => Items.Where(i => i.Action != "未处理").Sum(i => i.SourceSize);
     [JsonIgnore] public long CompletedSourceBytes => Items.Where(i => i.Status == "完成").Sum(i => i.SourceSize);
     [JsonIgnore] public long OutputBytes => Items.Where(i => i.Status == "完成").Sum(i => i.OutputSize);
@@ -188,5 +234,6 @@ public sealed class AppearanceSettings
 public static class Format
 {
     public static string Bytes(long n) { string[] units = ["B", "KB", "MB", "GB", "TB"]; double v = n; int u = 0; while (Math.Abs(v) >= 1000 && u < 4) { v /= 1000; u++; } return $"{v:0.##} {units[u]}"; }
-    public static string Time(double seconds) => seconds < 0 || !double.IsFinite(seconds) ? "—" : TimeSpan.FromSeconds(seconds).ToString(@"d\.hh\:mm\:ss");
+    static string FormatDuration(TimeSpan duration) => duration.Days > 0 ? duration.ToString(@"d\.hh\:mm\:ss") : duration.ToString(@"hh\:mm\:ss");
+    public static string Time(double seconds) => seconds < 0 || !double.IsFinite(seconds) ? "—" : FormatDuration(TimeSpan.FromSeconds(seconds));
 }

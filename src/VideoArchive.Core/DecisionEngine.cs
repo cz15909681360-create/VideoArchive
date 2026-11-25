@@ -57,6 +57,7 @@ public sealed class DecisionEngine
             if (m.Streams.Any(x => x.Type == "subtitle" && x.Codec != "mov_text")) return "源容器无法可靠保留字幕轨";
             if (ext == ".mov" && s.Codec == "AV1") return "MOV / AV1 组合兼容性未验证";
         }
+        if (m.BitDepth <= 0) return "位深未知，采用保守备份";
         if (m.Duration <= 0 || m.Fps <= 0) return "时长或帧率未知，采用保守备份";
         return null;
     }
@@ -81,7 +82,8 @@ public sealed class DecisionEngine
             if (factor < 1) { p.TargetWidth = Math.Max(2, (int)(m.Width * factor) / 2 * 2); p.TargetHeight = Math.Max(2, (int)(m.Height * factor) / 2 * 2); downsize = true; }
         }
         p.DropFrames = s.LimitFps && Math.Max(m.MaxFps, m.Fps) > s.FpsLimit + .02;
-        if (p.DropFrames) p.TargetFps = Math.Min(m.Fps, s.FpsLimit);
+        if (p.DropFrames) { p.TargetFps = Math.Min(m.Fps, s.FpsLimit); p.PlannedFpsLimit = s.FpsLimit; }
+        p.PlannedRateMode = s.RateMode;
         var recommendation = Recommendation.Get(p.TargetWidth, p.TargetHeight, p.TargetFps, s.Codec);
         var requested = s.BitrateMode == "智能推荐" ? recommendation.Mbps * s.Quality * (m.Hdr ? 1.25 : 1) : s.FixedMbps;
         p.TargetMbps = m.VideoMbps > 0 ? Math.Min(m.VideoMbps, requested) : requested;

@@ -3,11 +3,11 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Threading;
 using System.Windows.Media.Imaging;
-using Microsoft.Win32;
 using VideoArchive.Core;
 
 namespace VideoArchive;
@@ -38,6 +38,7 @@ public sealed class MainViewModel : Observable
     BitmapSource? wallpaperImage;
     public event Action? ReviewRequested;
     string outputParent = "";
+    string? queuedSourceScan;
     DateTime runStarted;
     public MainViewModel()
     {
@@ -47,10 +48,10 @@ public sealed class MainViewModel : Observable
         clockTimer.Tick += (_, _) => UpdateProgress();
         settings.PropertyChanged += SettingsChanged;
         NavigateCommand = new RelayCommand(p => Page = p?.ToString() ?? "压缩任务");
-        ChooseSourceCommand = new RelayCommand(_ => PickFolder(true), () => FolderSelectionEnabled);
-        ChooseOutputCommand = new RelayCommand(_ => PickFolder(false), () => FolderSelectionEnabled);
+        ChooseSourceCommand = new RelayCommand(async _ => await PickSourceAsync(), () => FolderSelectionEnabled);
+        ChooseOutputCommand = new RelayCommand(_ => PickOutput(), () => FolderSelectionEnabled);
         ScanCommand = new RelayCommand(async _ => await ScanAsync(), () => !Busy && initialized);
-        RunCommand = new RelayCommand(async _ => await RunAsync(), () => !Busy && job != null && initialized && job.PlanVersion == MediaPolicy.PlanVersion && !job.Items.Any(i => i.RequiresReview));
+        RunCommand = new RelayCommand(async _ => await RunAsync(), () => !Busy && job != null && initialized && job.PlanVersion == MediaPolicy.PlanVersion && !NeedsCadenceScan && !job.Items.Any(i => i.RequiresReview));
         SelectReviewCommand = new RelayCommand(_ => { foreach (var i in Items.Where(i => i.CanReview && i.RequiresReview)) i.ReviewSelected = true; }, () => CanMakeChoices);
         ClearReviewCommand = new RelayCommand(_ => { foreach (var i in Items) i.ReviewSelected = false; }, () => CanMakeChoices);
         CopyReviewCommand = new RelayCommand(p => ReviewTimecodes(p, "原样备份"), () => CanMakeChoices);
@@ -92,11 +93,21 @@ public sealed class MainViewModel : Observable
     public string[] CollisionOptions { get; } = ["跳过", "覆盖", "自动重命名"];
     public string[] FilterOptions { get; } = ["全部", "视频", "待决定", "时间码选择", "待压缩", "原样复制", "失败", "未处理"];
     public ICollectionView ItemView => CollectionViewSource.GetDefaultView(Items);
-    public EncodeSettings Settings { get => settings; private set { settings.PropertyChanged -= SettingsChanged; settings = value; settings.PropertyChanged += SettingsChanged; Raise(); Raise(nameof(ParameterSummary)); Raise(nameof(FixedBitrateEnabled)); RefreshOptions(); } }
+    public EncodeSettings Settings { get => settings; private set { settings.PropertyChanged -= SettingsChanged; settings = value; settings.PropertyChanged += SettingsChanged; Raise(); RefreshOptions(); RaiseModeProperties(); } }
     public Preset? SelectedPreset { get => selectedPreset; set { if (!Set(ref selectedPreset, value) || value == null) return; Settings = value.Settings.Snapshot(); PresetName = value.Name; ScheduleReplan(); Raise(nameof(DefaultPresetText)); } }
     public ArchiveJob? SelectedHistory { get => selectedHistory; set => Set(ref selectedHistory, value); }
     public PlanItem? SelectedItem { get => selectedItem; set => Set(ref selectedItem, value); }
-    public string SourceRoot { get => sourceRoot; set { if (Set(ref sourceRoot, value)) { UpdateOutputRoot(); InvalidateScan(); } } }
+    public string SourceRoot
+    {
+        get => sourceRoot;
+        set
+        {
+            if (!Set(ref sourceRoot, value)) return;
+            queuedSourceScan = null;
+            UpdateOutputRoot();
+            InvalidateScan();
+        }
+    }
     public string OutputRoot { get => outputRoot; private set { if (Set(ref outputRoot, value)) { Raise(nameof(OutputFolderName)); InvalidateScan(); } } }
     public string OutputFolderName => Path.GetFileName(OutputRoot);
     public bool OtherOutput { get => otherOutput; set { if (Set(ref otherOutput, value)) UpdateOutputRoot(); } }
@@ -131,21 +142,49 @@ public sealed class MainViewModel : Observable
     public bool Paused { get => paused; private set { Set(ref paused, value); Raise(nameof(PauseLabel)); } }
     public bool Advanced { get => advanced; set => Set(ref advanced, value); }
     public string PauseLabel => Paused ? "继续队列" : "暂停队列";
-    public string ParameterSummary => Settings.Summary;
+    public string ParameterSummary
+    {
+        get
+        {
+            if (Settings.Backend != "NVIDIA") return Settings.Summary;
+            var preset = Settings.EncoderPreset == "自动"
+                ? $"自动（{(job?.AutomaticNvidiaPreset ?? CommandBuilder.DefaultNvidiaPreset).ToUpperInvariant()}）"
+                : Settings.EncoderPreset.ToUpperInvariant();
+            return $"{Settings.Summary} · 编码预设 {preset}";
+        }
+    }
     public string DefaultPresetText => SelectedPreset?.Id == configuration.DefaultPresetId ? "★ 默认方案" : "可保存当前参数或设为默认";
     public string CapabilityText => capabilities.Count == 0 ? "正在检测…" : string.Join("\n", capabilities.Select(c => $"{c.Backend,-7} {c.Codec,-6}  {(c.Available ? "可用" + (c.TenBit ? " · 8/10-bit" : " · 8-bit") : "不可用 · " + c.Error.Split('\n')[0])}"));
     public string ScanSummary => job == null ? "尚未扫描 · 不会修改源文件" : $"{job.Items.Count(i => i.VideoCandidate || i.Media != null)} 个视频 · {job.Items.Count(i => !i.VideoCandidate && i.Media == null && i.Action != "未处理")} 个配套文件 · {job.Directories.Count} 个文件夹 · 原始 {Format.Bytes(job.SourceBytes)} · 时长 {Format.Time(job.Items.Sum(i => i.Media?.Duration ?? 0))}";
-    public string EstimateSummary => job == null ? "扫描后显示预计容量与处理原因" : $"预计新增输出 {Format.Bytes(job.Items.Sum(i => i.EstimatedSize))} · 待压缩 {job.Items.Count(i => i.Action == "压缩")} · 复制 {job.Items.Count(i => i.Action == "复制")} · 待决定 {job.Items.Count(i => i.RequiresReview)} · 跳过 {job.Items.Count(i => i.Action == "跳过")} · 未处理 {job.Items.Count(i => i.Action == "未处理")}（容量为估计）";
+    public string EstimateSummary => job == null ? "扫描后显示预计容量与处理原因"
+        : NeedsCadenceScan ? "开启限帧后需要重新扫描，以检测峰值帧率。"
+        : $"计划容量 {Format.Bytes(job.Items.Sum(i => i.EstimatedSize))} · 已验证 {Format.Bytes(job.OutputBytes)} · 待压缩 {job.Items.Count(i => i.PendingCompression)} · 待决定 {PendingReviewCount}";
     public string Distribution => job == null ? "" : string.Join("   |   ", job.Items.Where(i => i.Media != null).GroupBy(i => $"{i.Media!.Width}×{i.Media.Height} / {i.Media.Codec}").OrderByDescending(g => g.Count()).Take(7).Select(g => $"{g.Key}：{g.Count()}"));
     public string Notices => job == null ? "" : string.Join("\n", job.Notices);
     public string Report => job == null ? "完成后在此显示实际结果" : ReportService.Summary(job);
     public double OverallProgress => job == null || job.Items.Count == 0 ? 0 : job.Items.Average(i => i.Action == "未处理" || i.Status is "完成" or "已跳过" or "失败" ? 100 : i.Progress);
     public string ProgressText => job == null ? "等待扫描" : $"{job.Items.Count(i => i.Status is "完成" or "已跳过" or "未处理")}/{job.Items.Count} 个文件 · {OverallProgress:0.#}%";
-    public string CurrentFile => job == null ? "" : string.Join("\n", job.Items.Where(i => i.Status is "压缩中" or "复制中" or "验证中").Select(i => $"{i.RelativePath} · {i.Progress:0.#}% · {i.Detail}"));
+    public string CurrentFile => job == null ? "" : string.Join("\n", job.Items.Where(i => i.Status is "压缩中" or "复制中" or "验证中" or "等待验证").Select(i => $"{i.RelativePath} · {i.Progress:0.#}% · {i.Detail}"));
     public string Eta => !Busy || job == null || OverallProgress <= 0 ? "剩余时间：—" : $"预计剩余 {Format.Time((DateTime.Now - runStarted).TotalSeconds * (100 - OverallProgress) / OverallProgress)} · 已验证输出 {Format.Bytes(job.OutputBytes)}";
-    public bool PeakLimitSupported => !(Settings.Backend == "CPU" && Settings.Codec == "AV1" && Settings.RateMode == "VBR");
+    public bool PeakLimitSupported => Settings.RateMode != "CBR" && !(Settings.Backend == "CPU" && Settings.Codec == "AV1" && Settings.RateMode == "VBR");
     public bool FixedBitrateEnabled => Settings.BitrateMode == "固定上限";
-    public string RateNote => Settings.RateMode == "恒定质量" ? "CRF/CQ 控制画质，容量为粗略估计；成品更大时原样备份。" : Settings.RateMode == "CBR" ? "CBR 不推荐用于离线备份；码率目标仍受源码率限制。" : !PeakLimitSupported ? "SVT-AV1 的 VBR 支持平均目标，不支持独立峰值上限；成品仍执行不增大校验。" : $"VBR 允许复杂场景短时达到平均目标的 {Settings.MaxMultiplier:0.##} 倍。1 Mbps ≈ 0.45 GB/小时（不含音频）。";
+    public bool NvidiaDecodeAvailable => Settings.Backend == "NVIDIA" && Settings.Codec == "HEVC";
+    public bool SmartBitrateEnabled => !FixedBitrateEnabled;
+    public bool PreserveFps => !Settings.LimitFps;
+    public string FpsLabel => PreserveFps ? "帧率" : "最高帧率（fps）";
+    public string BitrateLabel => SmartBitrateEnabled ? "推荐视频码率"
+        : Settings.RateMode == "恒定质量" ? "参考视频码率（Mbps）" : "目标平均视频码率（Mbps）";
+    bool NeedsCadenceScan => ScanService.RequiresCadenceRescan(job, Settings);
+
+    void RaiseModeProperties()
+    {
+        foreach (var name in new[] { nameof(ParameterSummary), nameof(RateNote), nameof(PeakLimitSupported), nameof(FixedBitrateEnabled),
+            nameof(NvidiaDecodeAvailable), nameof(SmartBitrateEnabled), nameof(PreserveFps), nameof(FpsLabel), nameof(BitrateLabel), nameof(EstimateSummary) })
+            Raise(name);
+        CommandManager.InvalidateRequerySuggested();
+    }
+
+    public string RateNote => Settings.RateMode == "恒定质量" ? "CRF/CQ 控制画质，容量为粗略估计；成品更大时原样备份。" : Settings.RateMode == "CBR" ? "CBR 不推荐用于离线备份；码率目标仍受源码率限制。" : !PeakLimitSupported ? "SVT-AV1 的 VBR 支持平均目标，不支持独立峰值上限；成品仍执行不增大校验。" : $"VBR 按目标平均视频码率编码，峰值参数为目标的 {Settings.MaxMultiplier:0.##} 倍。实际码率与容量以成品为准。";
     public ICommand NavigateCommand { get; } public ICommand ChooseSourceCommand { get; } public ICommand ChooseOutputCommand { get; } public ICommand ScanCommand { get; } public ICommand RunCommand { get; }
     public ICommand PauseCommand { get; } public ICommand CancelCommand { get; } public ICommand RetryCommand { get; } public ICommand SavePresetCommand { get; } public ICommand DuplicatePresetCommand { get; }
     public ICommand RenamePresetCommand { get; } public ICommand DeletePresetCommand { get; } public ICommand DefaultPresetCommand { get; } public ICommand LoadHistoryCommand { get; }
@@ -156,6 +195,7 @@ public sealed class MainViewModel : Observable
     public async Task InitializeAsync(bool first = true, bool forceDetection = false)
     {
         if (Busy) return;
+        initialized = false;
         DetectingHardware = true;
         try
         {
@@ -192,6 +232,10 @@ public sealed class MainViewModel : Observable
         });
         }
         finally { DetectingHardware = false; }
+        var queued = queuedSourceScan;
+        queuedSourceScan = null;
+        if (queued != null && string.Equals(queued, SourceRoot, StringComparison.OrdinalIgnoreCase))
+            await ScanSelectedSourceAsync();
     }
     async Task Guard(Func<Task> action)
     {
@@ -207,9 +251,11 @@ public sealed class MainViewModel : Observable
         await Guard(async () =>
         {
             ValidateEncoding();
-            job = await scanner!.ScanAsync(SourceRoot, OutputRoot, Settings, text => dispatcher.BeginInvoke(() => Status = text), cancellation!.Token);
+            var source = SourceRoot; var output = OutputRoot; var settings = Settings.Snapshot();
+            var token = cancellation!.Token;
+            job = await Task.Run(() => scanner!.ScanAsync(source, output, settings, text => dispatcher.BeginInvoke(() => Status = text), token, job), token);
             PopulateItems(); new ArchiveService(FfmpegPath, FfprobePath, dataDirectory).Save(job);
-            Status = $"扫描完成 · {scanner.LastScanTime.TotalSeconds:0.0} 秒 · 复用 {scanner.LastCacheHits} 个视频缓存 · " + (job.Items.Any(i => i.RequiresReview) ? "请先选择时间码待决定文件的处理方式" : "查看处理原因后开始备份"); RaiseJob(); RefreshHistory();
+            Status = $"扫描完成 · {scanner!.LastScanTime.TotalSeconds:0.0} 秒 · 复用 {scanner.LastCacheHits} 个视频缓存 · " + (job.Items.Any(i => i.RequiresReview) ? "请先选择时间码待决定文件的处理方式" : "查看处理原因后开始备份"); RaiseJob(); RefreshHistory();
             completed = true;
         });
         if (completed && PendingReviewCount > 0) ReviewRequested?.Invoke();
@@ -217,12 +263,18 @@ public sealed class MainViewModel : Observable
     async Task RunAsync()
     {
         if (job == null) return;
+        if (NeedsCadenceScan) { Status = "开启限帧后需要重新扫描，以检测峰值帧率。"; return; }
         replanTimer.Stop(); if (job.State == "已扫描") Replan();
+        if (job.Items.Any(i => i.RequiresReview)) { RaiseJob(); return; }
         await Guard(async () =>
         {
             ValidateEncoding(); archive = new(FfmpegPath, FfprobePath, dataDirectory);
             if (job.Items.Any(i => i.Action == "压缩" && !capabilities.Any(c => c.Backend == job.Settings.Backend && c.Codec == (i.TargetCodec.Length > 0 ? i.TargetCodec : job.Settings.Codec) && c.Available && (i.TargetDepth <= 8 || c.TenBit)))) throw new InvalidOperationException("历史任务需要对应编码器和位深支持，请更换编码器并重新扫描。");
-            archive.Changed += (_, text) => dispatcher.BeginInvoke(() => { Status = text; UpdateProgress(); ItemView.Refresh(); });
+            archive.Changed += (item, message) =>
+            {
+                bool terminal = item == null || item.Status is "完成" or "失败" or "已跳过" or "已取消";
+                if (terminal) dispatcher.BeginInvoke(() => { Status = message; UpdateProgress(); ItemView.Refresh(); });
+            };
             await Task.Run(() => archive.RunAsync(job, cancellation!.Token));
             Status = job.State; UpdateProgress(); RefreshHistory();
         });
@@ -236,12 +288,19 @@ public sealed class MainViewModel : Observable
         if (Settings.RateMode == "CBR" && !c.Cbr) throw new InvalidOperationException("此编码器未验证CBR支持，请选择VBR或恒定质量。");
     }
     void SettingsChanged(object? sender, PropertyChangedEventArgs e)
-    { if (refreshingOptions) return; Raise(nameof(ParameterSummary)); Raise(nameof(RateNote)); Raise(nameof(PeakLimitSupported)); Raise(nameof(FixedBitrateEnabled)); if (e.PropertyName is nameof(EncodeSettings.Backend) or nameof(EncodeSettings.Codec) or nameof(EncodeSettings.Depth)) RefreshOptions(); ScheduleReplan(); }
+    {
+        if (refreshingOptions) return;
+        if (e.PropertyName is nameof(EncodeSettings.Backend) or nameof(EncodeSettings.Codec) or nameof(EncodeSettings.Depth))
+            RefreshOptions();
+        RaiseModeProperties();
+        ScheduleReplan();
+    }
     void ScheduleReplan() { if (Busy) return; replanTimer.Stop(); replanTimer.Start(); }
     void Replan()
     {
         if (job == null || Busy) return;
         if (job.State != "已扫描") { InvalidateScan(); return; }
+        if (NeedsCadenceScan) { Status = "开启限帧后需要重新扫描，以检测峰值帧率。"; RaiseJob(); return; }
         try { scanner?.Replan(job, Settings); new ArchiveService(FfmpegPath, FfprobePath, dataDirectory).Save(job); PopulateItems(); RaiseJob(); Status = "已按当前参数更新扫描计划，保留逐文件选择"; }
         catch (Exception ex) { Status = ex.Message; }
     }
@@ -267,6 +326,7 @@ public sealed class MainViewModel : Observable
     }
     static bool HasValidationError(DependencyObject obj)
     {
+        if (obj is UIElement { Visibility: Visibility.Collapsed }) return false;
         if (System.Windows.Controls.Validation.GetHasError(obj)) return true;
         for (int i = 0; i < System.Windows.Media.VisualTreeHelper.GetChildrenCount(obj); i++)
             if (HasValidationError(System.Windows.Media.VisualTreeHelper.GetChild(obj, i))) return true;
@@ -274,8 +334,8 @@ public sealed class MainViewModel : Observable
     }
     void InvalidateScan() { if (Busy && !DetectingHardware) return; job = null; Items.Clear(); RaiseJob(); }
     void PopulateItems() { Items.Clear(); if (job != null) foreach (var i in job.Items) Items.Add(i); ApplyFilter(); }
-    void ApplyFilter() { ItemView.Filter = value => value is PlanItem i && (Filter switch { "视频" => i.VideoCandidate || i.Media != null, "待决定" => i.RequiresReview, "时间码选择" => i.ReviewIssue.Length > 0, "待压缩" => i.Action == "压缩", "原样复制" => i.Action == "复制", "失败" => i.Status == "失败", "未处理" => i.Action == "未处理", _ => true }); ItemView.Refresh(); }
-    void RaiseJob() { foreach (var name in new[] { nameof(ScanSummary), nameof(EstimateSummary), nameof(Distribution), nameof(Notices), nameof(Report), nameof(OverallProgress), nameof(ProgressText), nameof(CurrentFile), nameof(Eta), nameof(HasReviewItems), nameof(CanMakeChoices), nameof(ReviewSummary), nameof(PendingReviewCount), nameof(ReviewAlert) }) Raise(name); CommandManager.InvalidateRequerySuggested(); }
+    void ApplyFilter() { ItemView.Filter = value => value is PlanItem i && (Filter switch { "视频" => i.VideoCandidate || i.Media != null, "待决定" => i.RequiresReview, "时间码选择" => i.ReviewIssue.Length > 0, "待压缩" => i.PendingCompression, "原样复制" => i.Action == "复制", "失败" => i.Status == "失败", "未处理" => i.Action == "未处理", _ => true }); ItemView.Refresh(); }
+    void RaiseJob() { foreach (var name in new[] { nameof(ParameterSummary), nameof(ScanSummary), nameof(EstimateSummary), nameof(Distribution), nameof(Notices), nameof(Report), nameof(OverallProgress), nameof(ProgressText), nameof(CurrentFile), nameof(Eta), nameof(HasReviewItems), nameof(CanMakeChoices), nameof(ReviewSummary), nameof(PendingReviewCount), nameof(ReviewAlert) }) Raise(name); CommandManager.InvalidateRequerySuggested(); }
     public bool ReviewTimecodes(object? parameter, string choice)
     {
         if (!CanMakeChoices || job == null || scanner == null) return false;
@@ -322,14 +382,42 @@ public sealed class MainViewModel : Observable
     }
     void ChooseWallpaper()
     {
-        var dialog = new OpenFileDialog { Title = "选择自定义壁纸", Filter = "图片（PNG / JPG / BMP / GIF）|*.png;*.jpg;*.jpeg;*.bmp;*.gif" };
-        if (dialog.ShowDialog() != true) return;
-        try { SetWallpaper(dialog.FileName); }
+        var path = PickPath(PickerPurpose.Wallpaper, "选择自定义壁纸", configuration.Appearance.WallpaperFile);
+        if (path == null) return;
+        try { SetWallpaper(path); }
         catch (Exception ex) when (ex is IOException or NotSupportedException or FileFormatException or ArgumentException or UnauthorizedAccessException) { Status = "壁纸无法读取：" + ex.Message; }
     }
-    void UpdateProgress() { foreach (var name in new[] { nameof(Report), nameof(OverallProgress), nameof(ProgressText), nameof(CurrentFile), nameof(Eta), nameof(JobRunning) }) Raise(name); CommandManager.InvalidateRequerySuggested(); }
-    void PickFolder(bool source) { var dialog = new OpenFolderDialog { Title = source ? "选择源素材目录" : "选择其他存放位置，将创建“源文件夹名_已压缩”" }; if (dialog.ShowDialog() == true) { if (source) SourceRoot = dialog.FolderName; else { OutputParent = dialog.FolderName; OtherOutput = true; } } }
-    void PickTool(bool ffmpeg) { var dialog = new OpenFileDialog { Filter = "可执行文件|*.exe" }; if (dialog.ShowDialog() == true) { if (ffmpeg) FfmpegPath = dialog.FileName; else FfprobePath = dialog.FileName; } }
+    void UpdateProgress() { foreach (var name in new[] { nameof(Report), nameof(EstimateSummary), nameof(OverallProgress), nameof(ProgressText), nameof(CurrentFile), nameof(Eta), nameof(JobRunning) }) Raise(name); CommandManager.InvalidateRequerySuggested(); }
+    static string? PickPath(PickerPurpose purpose, string title, string? initial, string? suggestedName = null)
+    {
+        var dialog = new PathPickerWindow(purpose, title, initial, suggestedName) { Owner = Application.Current.MainWindow };
+        return dialog.ShowDialog() == true ? dialog.SelectedResult : null;
+    }
+
+    async Task PickSourceAsync()
+    {
+        if (!FolderSelectionEnabled) return;
+        if (PickPath(PickerPurpose.Source, "选择源素材文件夹", SourceRoot) is { } path)
+            await SelectSourceAndScanAsync(path);
+    }
+
+    void PickOutput()
+    {
+        if (!FolderSelectionEnabled) return;
+        string? initial = Directory.Exists(OutputParent) ? OutputParent : Path.GetDirectoryName(OutputRoot);
+        if (PickPath(PickerPurpose.Output, "选择备份存放位置", initial) is not { } path) return;
+        OutputParent = path;
+        OtherOutput = true;
+        if (!DetectingHardware) Status = "输出位置已更新，点击“扫描素材”生成新计划。";
+    }
+
+    void PickTool(bool ffmpeg)
+    {
+        string tool = ffmpeg ? "FFmpeg" : "FFprobe";
+        if (PickPath(PickerPurpose.Engine, $"选择 {tool} 可执行文件", ffmpeg ? FfmpegPath : FfprobePath) is not { } path) return;
+        if (ffmpeg) FfmpegPath = path;
+        else FfprobePath = path;
+    }
     string RequireName() => string.IsNullOrWhiteSpace(PresetName) ? "我的备份方案" : PresetName.Trim();
     void SavePreset(bool duplicate)
     {
@@ -358,31 +446,86 @@ public sealed class MainViewModel : Observable
         outputParent = Path.GetDirectoryName(j.OutputRoot) ?? ""; Raise(nameof(OtherOutput)); Raise(nameof(OutputParent));
         OutputRoot = j.OutputRoot; Settings = j.Settings.Snapshot(); job = j;
         selectedPreset = null; Raise(nameof(SelectedPreset));
-        foreach (var p in job.Items.Where(i => i.Status is "压缩中" or "复制中" or "验证中" or "已取消")) { p.Status = "待处理"; p.Progress = 0; }
+        foreach (var p in job.Items.Where(i => i.Status is "压缩中" or "复制中" or "验证中" or "等待验证" or "已取消")) { p.Status = "待处理"; p.Progress = 0; }
         PopulateItems(); RaiseJob(); Page = "压缩任务"; Status = job.PlanVersion == MediaPolicy.PlanVersion ? "已载入历史 · 恢复执行会先验证已完成的输出" : "已载入旧任务 · 请重新扫描以使用新的时间码选择与Main10规则";
         if (job.PlanVersion == MediaPolicy.PlanVersion && PendingReviewCount > 0) ReviewRequested?.Invoke();
     }
     void Export(bool json)
     {
-        if (job == null) return;
-        var dialog = new SaveFileDialog { FileName = "VideoArchive-" + job.Started.ToString("yyyyMMdd-HHmm"), Filter = json ? "JSON 报告|*.json" : "CSV 报告|*.csv" };
-        if (dialog.ShowDialog() != true) return;
-        try { if (json) JsonStore.Write(dialog.FileName, job); else ReportService.ExportCsv(job, dialog.FileName); Status = "报告已导出"; } catch (Exception ex) { Status = ex.Message; }
+        if (job is not { } report) return;
+        string? initial = Directory.Exists(report.OutputRoot) ? report.OutputRoot : Path.GetDirectoryName(report.OutputRoot);
+        string name = "VideoArchive-" + report.Started.ToString("yyyyMMdd-HHmm");
+        string? path = PickPath(json ? PickerPurpose.Json : PickerPurpose.Csv, json ? "导出 JSON 报告" : "导出 CSV 报告", initial, name);
+        if (path == null) return;
+        try { if (json) JsonStore.Write(path, report); else ReportService.ExportCsv(report, path); Status = "报告已导出"; } catch (Exception ex) { Status = ex.Message; }
     }
     void ShowLog()
     {
         if (SelectedItem == null) return;
         var p = SelectedItem;
-        var box = new System.Windows.Controls.TextBox { Text = $"{p.RelativePath}\n{p.SourceSpec}\n{p.TargetSpec}\n{p.Reason}\n{p.DisplayStatus}\n\n{(p.Action == "压缩" && p.Media != null ? CommandBuilder.Preview(p, job!.Settings, FfmpegPath) : "原样复制无需编码命令")}\n\n{p.Log}", IsReadOnly = true, TextWrapping = TextWrapping.Wrap, VerticalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Auto, Margin = new Thickness(16), FontFamily = new System.Windows.Media.FontFamily("Consolas, Microsoft YaHei UI") };
+        string command = p.Log;
+        if (command.Length == 0 && p.Action == "压缩" && p.Media != null && job is { } current)
+            command = CommandBuilder.Preview(p, current.Settings, FfmpegPath,
+                current.Settings.NvidiaDecode && CommandBuilder.CanDecodeOnNvidia(p, current.Settings), current.AutomaticNvidiaPreset);
+        var box = new TextBox
+        {
+            Text = $"{p.RelativePath}\n源规格 · {p.SourceSpec}\n{p.TargetSpec}\n{(p.Status == "完成" ? p.OutputSpec + "\n" : "")}{p.Reason}\n{p.DisplayStatus}\n\n{command}",
+            IsReadOnly = true, TextWrapping = TextWrapping.Wrap,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            Margin = new Thickness(16), FontFamily = new System.Windows.Media.FontFamily("Consolas, Microsoft YaHei UI")
+        };
         new Window { Title = "文件详情 / FFmpeg 命令（可选择复制）", Owner = Application.Current.MainWindow, Width = 850, Height = 540, Content = box, WindowStartupLocation = WindowStartupLocation.CenterOwner }.Show();
     }
-    public void DropFolder(string path) { if (FolderSelectionEnabled && Directory.Exists(path)) { SourceRoot = path; Page = "压缩任务"; } }
+    internal async Task SelectSourceAndScanAsync(string path)
+    {
+        if (!FolderSelectionEnabled) { Status = "当前任务运行中，结束后可以更换源文件夹。"; return; }
+        if (!Directory.Exists(path)) { Status = "源文件夹已不可访问，请重新选择。"; return; }
+        SourceRoot = Files.Normalize(path);
+        Page = "压缩任务";
+        Filter = "全部";
+        if (DetectingHardware)
+        {
+            queuedSourceScan = SourceRoot;
+            Status = "已选源文件夹，硬件检测完成后自动扫描。";
+            return;
+        }
+        await ScanSelectedSourceAsync();
+    }
+
+    async Task ScanSelectedSourceAsync()
+    {
+        if (!initialized)
+        {
+            Status = "已选源文件夹。请在设置中检查编码引擎并重新检测，然后扫描素材。";
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(OutputRoot))
+        {
+            Status = "已选源文件夹。请先选择有效的备份存放位置，再扫描素材。";
+            return;
+        }
+        try { Files.ValidateRoots(SourceRoot, OutputRoot); }
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+        { Status = ex.Message + " 请调整文件夹后再扫描。"; return; }
+        await ScanAsync();
+    }
     public async Task PrepareCaptureAsync(string? source, string? output, string? targetPage, bool showAdvanced)
     {
         if (source != null) { SourceRoot = source; if (output != null) { OutputParent = output; OtherOutput = true; } await ScanAsync(); }
         if (targetPage != null) Page = targetPage;
         Advanced = showAdvanced;
     }
+    public async Task VerifyArchiveAsync()
+    {
+        if (Environment.GetEnvironmentVariable("VIDEOARCHIVE_TEST_DATA") == null || job == null ||
+            job.Settings.Backend is not ("CPU" or "NVIDIA") || Directory.Exists(OutputRoot) || !job.Items.Any(item => item.Action == "压缩"))
+            throw new InvalidOperationException("Archive verification requires isolated state, a CPU or NVIDIA preset, input, and an unused output folder.");
+        await RunAsync();
+        if (job is not { State: "完成" } || !job.Items.Any(item => item is { Action: "压缩", Status: "完成", VerifiedVideo: not null }) ||
+            job.Items.Any(item => item.Status != "完成"))
+            throw new InvalidOperationException("Packaged archive did not verify the sample.");
+    }
+
     public void PrepareReviewDemo()
     {
         var media = job?.Items.FirstOrDefault(i => i.Media != null)?.Media;
@@ -441,6 +584,21 @@ public sealed class MainViewModel : Observable
                 if (Settings.Codec != codec || Settings.Profile != "自动" || string.IsNullOrEmpty(Settings.Depth) || string.IsNullOrEmpty(Settings.RateMode) || string.IsNullOrEmpty(Settings.EncoderPreset)) throw new InvalidOperationException("UI verification: options lost while switching");
             }
         }
+        Settings.BitrateMode = "智能推荐";
+        Settings.LimitFps = false;
+        if (!SmartBitrateEnabled || FixedBitrateEnabled || !PreserveFps) throw new InvalidOperationException("UI verification: smart parameters");
+        Settings.BitrateMode = "固定上限";
+        Settings.LimitFps = true;
+        if (SmartBitrateEnabled || !FixedBitrateEnabled || PreserveFps) throw new InvalidOperationException("UI verification: active limits");
+        if (Application.Current.MainWindow.FindName("FixedRateInput") is not TextBox fixedRate)
+            throw new InvalidOperationException("UI verification: missing target bitrate input");
+        fixedRate.SetCurrentValue(TextBox.TextProperty, "invalid");
+        fixedRate.GetBindingExpression(TextBox.TextProperty)?.UpdateSource();
+        if (!Validation.GetHasError(fixedRate)) throw new InvalidOperationException("UI verification: invalid active field");
+        Settings.BitrateMode = "智能推荐";
+        await dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
+        if (HasValidationError(Application.Current.MainWindow)) throw new InvalidOperationException("UI verification: inactive field blocks backup");
+        replanTimer.Stop();
         Settings = initial;
         PresetName = "UI验证方案"; SavePreset(true);
         var saved = JsonStore.Read<AppConfiguration>(Path.Combine(dataDirectory, "settings.json"));

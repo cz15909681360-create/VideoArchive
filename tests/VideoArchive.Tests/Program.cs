@@ -1,6 +1,13 @@
 using System.Text;
 using VideoArchive.Core;
 
+if (args is ["--archive-benchmark", var benchSource, var benchWork, var benchReport, .. var modes])
+{
+    if (modes.Length == 0) throw new ArgumentException("Provide at least one benchmark mode.");
+    await ArchiveBenchmark.RunAsync(benchSource, benchWork, benchReport, modes);
+    return;
+}
+
 int checks = 0;
 void Check(bool value, string name) { if (!value) throw new Exception("FAIL: " + name); checks++; Console.WriteLine("PASS " + name); }
 var engine = new DecisionEngine();
@@ -58,6 +65,42 @@ Check(Recommendation.Get(1920, 1080, 60, "AV1").Mbps == 12.5, "AV1 table midpoin
 Check(Recommendation.Get(3000, 1700, 45, "HEVC").Estimated, "nonstandard recommendation labeled estimate");
 var original = new EncodeSettings { Quality = 1.25, Limit1080 = true }; var snapshot = original.Snapshot(); original.Quality = .75;
 Check(snapshot.Quality == 1.25 && snapshot.Limit1080, "settings snapshot is independent");
+var noCadence = Media(55, 30);
+noCadence.CadenceChecked = false;
+noCadence.Vfr = true;
+noCadence.Chroma = "4:2:0";
+var nvidia = new EncodeSettings { Backend = "NVIDIA", BitrateMode = "固定上限", FixedMbps = 20 };
+var testItem = Decide(noCadence, nvidia);
+var oldJob = new ArchiveJob { Settings = nvidia, Items = [testItem] };
+var withLimit = nvidia.Snapshot();
+withLimit.LimitFps = true;
+Check(ScanService.RequiresCadenceRescan(oldJob, withLimit), "enabling FPS limit on an incomplete probe requires explicit rescan");
+Check(testItem.SourceSpec.Contains("8-bit 4:2:0") && testItem.SourceSpec.Contains("55 Mbps") &&
+    testItem.SourceSpec.Contains("30 fps VFR") && testItem.SourceSpec.Contains("00:01:40"), "source row displays the measured video specification");
+Check(testItem.OutputSpec.StartsWith("计划") && testItem.PendingCompression, "pending row shows the planned output");
+Check(!CommandBuilder.CanDecodeOnNvidia(testItem, nvidia), "variable cadence uses the standard decoding path");
+noCadence.Vfr = false;
+Check(CommandBuilder.CanDecodeOnNvidia(testItem, nvidia), "same-format Nvidia candidate");
+Check(!nvidia.NvidiaDecode && nvidia.Snapshot().NvidiaDecode == false, "hardware input decode is opt-in for old presets");
+nvidia.NvidiaDecode = true;
+Check(nvidia.Snapshot().NvidiaDecode, "hardware input decode round-trips the preset");
+var cudaCommand = CommandBuilder.Build(testItem, nvidia, @"C:\backup\a.mp4", true);
+Check(cudaCommand.Contains("-hwaccel:0") && cudaCommand.Contains("hevc_nvenc") && cudaCommand.Contains("p5") &&
+    !cudaCommand.Contains("-filter:0"), "CUDA retains encoder and omits redundant software format");
+var savedLegacyJob = System.Text.Json.JsonSerializer.Deserialize<ArchiveJob>(
+    """{"PlanVersion":4,"Settings":{"Backend":"NVIDIA","EncoderPreset":"自动"}}""", JsonStore.Options)!;
+Check(CommandBuilder.Build(testItem, savedLegacyJob.Settings, @"C:\backup\a.mp4",
+    automaticNvidiaPreset: savedLegacyJob.AutomaticNvidiaPreset).Contains("p6"), "resuming a legacy automatic NVIDIA job uses P6");
+Check(JsonStore.Clone(new ArchiveJob()).AutomaticNvidiaPreset == "p5", "new jobs persist P5 across resume");
+var manualP6 = nvidia.Snapshot();
+manualP6.EncoderPreset = "p6";
+Check(CommandBuilder.Build(testItem, manualP6, @"C:\backup\a.mp4").Contains("p6"), "manual P6 overrides the new default");
+testItem.VerifiedVideo = new VideoSpecification(3840, 2160, "hevc", 8, "4:2:0", 23.4, 30, 100);
+testItem.Status = "完成";
+Check(!testItem.PendingCompression && testItem.OutputSpec.Contains("23.4 Mbps") && testItem.TargetSpec.Contains("20 Mbps"), "completed row shows verified bitrate and keeps the plan");
+testItem.VerifiedVideo = null;
+Check(testItem.OutputSpec == "成品规格未记录", "legacy completed row does not claim unrecorded measurements");
+
 var command = CommandBuilder.Build(Decide(Media(45, 120)), new() { Backend = "NVIDIA", LimitFps = true }, @"C:\backup\a.mp4");
 Check(command.Contains("passthrough") && command.Any(s => s.Contains("select=")) && !command.Contains("-r"), "no duplicate-frame rate conversion");
 Check(Files.Contains(@"C:\", @"C:\folder\clip.mp4") && !Files.Contains(@"C:\source", @"C:\source-other\clip.mp4"), "drive root and directory-boundary containment");

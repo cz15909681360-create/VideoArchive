@@ -95,6 +95,7 @@ public static class ProcessRunner
 {
     public static async Task<ProcessResult> RunAsync(string executable, IEnumerable<string> arguments, CancellationToken ct, Action<string>? line = null)
     {
+        ct.ThrowIfCancellationRequested();
         if (!File.Exists(executable)) throw new FileNotFoundException("请在设置中配置有效的 FFmpeg / FFprobe 路径。", executable);
         var start = new ProcessStartInfo(executable) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8 };
         foreach (var a in arguments) start.ArgumentList.Add(a);
@@ -104,8 +105,9 @@ public static class ProcessRunner
         var stdout = new StringBuilder();
         var outputTask = Task.Run(async () => { while (await process.StandardOutput.ReadLineAsync(ct) is { } s) { if (line != null) line(s); else stdout.AppendLine(s); } }, ct);
         var errorTask = Task.Run(async () => { var b = new StringBuilder(); while (await process.StandardError.ReadLineAsync(ct) is { } s) { b.AppendLine(s); if (b.Length > 64000) b.Remove(0, b.Length - 32000); } return b.ToString(); }, ct);
-        await process.WaitForExitAsync(ct);
-        await outputTask;
+        await process.WaitForExitAsync();
+        await Task.WhenAll(outputTask, errorTask);
+        ct.ThrowIfCancellationRequested();
         return new(process.ExitCode, stdout.ToString(), await errorTask);
     }
     public static double Number(string? value) => double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var n) && double.IsFinite(n) ? n : 0;

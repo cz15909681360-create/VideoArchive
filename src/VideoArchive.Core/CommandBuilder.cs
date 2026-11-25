@@ -4,7 +4,10 @@ namespace VideoArchive.Core;
 
 public static class CommandBuilder
 {
-    public static List<string> Build(PlanItem item, EncodeSettings s, string temporaryOutput)
+    public const string DefaultNvidiaPreset = "p5";
+
+    public static List<string> Build(PlanItem item, EncodeSettings s, string temporaryOutput, bool gpuDecode = false,
+        string automaticNvidiaPreset = DefaultNvidiaPreset)
     {
         var m = item.Media ?? throw new InvalidOperationException("缺少视频信息。");
         s = MediaPolicy.EffectiveSettings(item, s);
@@ -13,7 +16,9 @@ public static class CommandBuilder
         var outputIndex = streams.FindIndex(x => x.Index == m.VideoIndex);
         var spec = ":" + outputIndex;
         var encoder = CapabilityService.Encoder(s.Backend, s.Codec);
-        var args = new List<string> { "-hide_banner", "-loglevel", "warning", "-nostdin", "-y", "-noautorotate", "-i", item.Source };
+        var args = new List<string> { "-hide_banner", "-loglevel", "warning", "-nostdin", "-y", "-noautorotate" };
+        if (gpuDecode) args.AddRange([$"-hwaccel:{m.VideoIndex}", "cuda", $"-hwaccel_output_format:{m.VideoIndex}", "cuda"]);
+        args.AddRange(["-i", item.Source]);
         void Add(string key, string value) { args.Add(key); args.Add(value); }
         foreach (var stream in streams) Add("-map", "0:" + stream.Index);
         Add("-map_metadata", "0"); Add("-map_chapters", "0"); Add("-c", "copy");
@@ -27,9 +32,9 @@ public static class CommandBuilder
         var filters = new List<string>();
         if (m.Width != item.TargetWidth || m.Height != item.TargetHeight) filters.Add($"scale={item.TargetWidth}:{item.TargetHeight}:flags=lanczos");
         if (item.DropFrames) filters.Add($"select='isnan(prev_selected_t)+gte(t-prev_selected_t,1/{ProcessRunner.N(s.FpsLimit)}-0.000001)'");
-        filters.Add("format=" + (item.TargetDepth == 10 ? s.Backend == "CPU" ? "yuv420p10le" : "p010le" : "yuv420p"));
-        Add("-filter" + spec, string.Join(',', filters));
-        var preset = s.EncoderPreset == "自动" ? s.Backend == "NVIDIA" ? "p6" : s.Backend == "CPU" && s.Codec == "AV1" ? "6" : s.Backend == "AMD" ? "quality" : "medium" : s.EncoderPreset;
+        if (!gpuDecode) filters.Add("format=" + (item.TargetDepth == 10 ? s.Backend == "CPU" ? "yuv420p10le" : "p010le" : "yuv420p"));
+        if (filters.Count != 0) Add("-filter" + spec, string.Join(',', filters));
+        var preset = s.EncoderPreset == "自动" ? s.Backend == "NVIDIA" ? automaticNvidiaPreset : s.Backend == "CPU" && s.Codec == "AV1" ? "6" : s.Backend == "AMD" ? "quality" : "medium" : s.EncoderPreset;
         Add(s.Backend == "AMD" ? "-quality" : "-preset", preset);
         var profile = MediaPolicy.ResolveProfile(s, item.TargetDepth);
         if (s.Codec != "AV1") Add("-profile" + spec, profile);
@@ -90,5 +95,14 @@ public static class CommandBuilder
         Add("-progress", "pipe:1"); args.Add("-nostats"); args.Add(temporaryOutput);
         return args;
     }
-    public static string Preview(PlanItem p, EncodeSettings s, string executable) => string.Join(' ', new[] { executable }.Concat(Build(p, s, p.Destination)).Select(v => "\"" + v.Replace("\"", "\\\"") + "\""));
+    public static bool CanDecodeOnNvidia(PlanItem item, EncodeSettings settings) =>
+        settings.Backend == "NVIDIA" && MediaPolicy.EffectiveSettings(item, settings).Codec == "HEVC" &&
+        item.Media is { Codec: "h264" or "hevc", Chroma: "4:2:0", Interlaced: false, Hdr: false, DynamicHdr: false, Vfr: false } media &&
+        media.BitDepth == item.TargetDepth && media.BitDepth is 8 or 10 &&
+        media.Width == item.TargetWidth && media.Height == item.TargetHeight &&
+        !item.DropFrames && !item.ConvertToTenBit420;
+
+    public static string Preview(PlanItem p, EncodeSettings s, string executable, bool gpuDecode = false,
+        string automaticNvidiaPreset = DefaultNvidiaPreset) => string.Join(' ', new[] { executable }
+        .Concat(Build(p, s, p.Destination, gpuDecode, automaticNvidiaPreset)).Select(v => "\"" + v.Replace("\"", "\\\"") + "\""));
 }

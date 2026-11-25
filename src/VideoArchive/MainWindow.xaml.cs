@@ -53,6 +53,7 @@ public partial class MainWindow : Window
             System.Diagnostics.PresentationTraceSources.DataBindingSource.Switch.Level = System.Diagnostics.SourceLevels.Error;
             await viewModel.PrepareCaptureAsync(Argument("--sample-source"), Argument("--sample-output"), Argument("--page"), arguments.Contains("--advanced"));
             if (Argument("--wallpaper") is { } wallpaper) viewModel.SetWallpaper(wallpaper);
+            if (arguments.Contains("--verify-archive")) await viewModel.VerifyArchiveAsync();
             if (arguments.Contains("--review-demo")) viewModel.PrepareReviewDemo();
             File.WriteAllText(arguments[preview + 1] + ".requests.txt", $"Automatic decision requests: {reviewRequests}\nPending files: {viewModel.PendingReviewCount}\nRun enabled: {viewModel.RunCommand.CanExecute(null)}");
             if (arguments.Contains("--verify-ui"))
@@ -88,7 +89,37 @@ public partial class MainWindow : Window
             bindingListener.Flush(); Close();
         }
     }
-    void Window_Drop(object sender, DragEventArgs e) { if (e.Data.GetData(DataFormats.FileDrop) is string[] paths && paths.Length > 0) viewModel.DropFolder(paths[0]); }
+    void Window_DragOver(object sender, DragEventArgs e)
+    {
+        if (!e.Data.GetDataPresent(DataFormats.FileDrop, false)) return;
+        bool valid = FolderDrop.TryRead(e.Data, out _, out var error);
+        bool accepted = FolderDrop.SetEffect(e, valid && viewModel.FolderSelectionEnabled) != DragDropEffects.None;
+        string hint = accepted ? "松开鼠标，选择该文件夹并开始扫描"
+            : !viewModel.FolderSelectionEnabled ? "当前任务运行中，结束后可以拖入文件夹。"
+            : valid ? "无法接收此次拖放。" : error;
+        FolderDropHint.Text = hint;
+        FolderDropBanner.Background = (Brush)new BrushConverter().ConvertFromString(accepted ? "#D8EDFA" : "#FFF1E2")!;
+        if (!viewModel.TaskPage) GlobalStatus.SetCurrentValue(System.Windows.Controls.TextBlock.TextProperty, hint);
+    }
+    void Window_DragLeave(object sender, DragEventArgs e)
+    {
+        FolderDropHint.Text = "从资源管理器拖入一个文件夹，松开后开始扫描";
+        FolderDropBanner.Background = (Brush)new BrushConverter().ConvertFromString("#EDF5FD")!;
+        GlobalStatus.GetBindingExpression(System.Windows.Controls.TextBlock.TextProperty)?.UpdateTarget();
+    }
+    async void Window_Drop(object sender, DragEventArgs e)
+    {
+        Window_DragLeave(sender, e);
+        if (!e.Data.GetDataPresent(DataFormats.FileDrop, false)) return;
+        bool valid = FolderDrop.TryRead(e.Data, out var folder, out var error);
+        if (FolderDrop.SetEffect(e, valid && viewModel.FolderSelectionEnabled) == DragDropEffects.None)
+        {
+            viewModel.Status = !viewModel.FolderSelectionEnabled ? "当前任务运行中，结束后可以更换源文件夹。"
+                : valid ? "无法接收此次拖放。" : error;
+            return;
+        }
+        await viewModel.SelectSourceAndScanAsync(folder);
+    }
     void Window_Closing(object? sender, CancelEventArgs e) => viewModel.RequestClose(e);
     void ShowFailures_Click(object sender, RoutedEventArgs e) => viewModel.Filter = "失败";
 }
