@@ -4,7 +4,7 @@ Windows 11 原生桌面程序，使用 FFmpeg 压缩视频素材库，保留分�
 
 [![Windows build](https://github.com/cz15909681360-create/VideoArchive/actions/workflows/build.yml/badge.svg)](https://github.com/cz15909681360-create/VideoArchive/actions/workflows/build.yml)
 
-**当前版本：1.3.3 · Windows x64 · C# / WPF / .NET 10**
+**当前版本：1.3.4 · Windows x64 · C# / WPF / .NET 10**
 
 [下载单文件 EXE 或便携 ZIP](https://github.com/cz15909681360-create/VideoArchive/releases/latest) · [使用与常见问题](docs/USER-GUIDE.md) · [架构与决策规则](docs/ARCHITECTURE.md) · [构建与发布](docs/BUILDING.md) · [更新记录](CHANGELOG.md)
 

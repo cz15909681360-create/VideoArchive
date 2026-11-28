@@ -167,7 +167,18 @@ public sealed class PlanItem : Observable
     public long OutputSize { get; set; }
     public string Log { get; set; } = "";
     string status = "待处理", detail = ""; double progress;
-    public string Status { get => status; set { Set(ref status, value); Raise(nameof(DisplayStatus)); Raise(nameof(OutputSpec)); Raise(nameof(OutputSizeText)); } }
+    public string Status
+    {
+        get => status;
+        set
+        {
+            Set(ref status, value);
+            Raise(nameof(DisplayStatus));
+            Raise(nameof(OutputSpec));
+            Raise(nameof(OutputSizeText));
+            Raise(nameof(VideoBitrateText));
+        }
+    }
     public string Detail { get => detail; set { Set(ref detail, value); Raise(nameof(DisplayStatus)); } }
     public double Progress { get => progress; set => Set(ref progress, value); }
     [JsonIgnore] public string SourceSpec => ((Media is { } media) ? VideoSpecification.FromMedia(media).Describe() : null) ?? (VideoCandidate ? "无法探测的视频" : "配套文件");
@@ -189,6 +200,23 @@ public sealed class PlanItem : Observable
         : VerifiedVideo is { } result ? "已验证 · " + (MxfToMov ? (Action == "压缩" ? "MOV · " : "MXF · ") : "") + result.Describe()
         : Action == "复制" && Media != null ? "已验证 · " + SourceSpec
         : VideoCandidate || Media != null ? "成品规格未记录" : "已验证 · 原样保留";
+    [JsonIgnore] public string VideoBitrateText
+    {
+        get
+        {
+            if (Media == null && !VideoCandidate) return "—";
+            string source = $"源 {BitrateNumber(Media?.VideoMbps)}";
+            if (Status == "已跳过" || Action is "跳过" or "未处理") return source;
+            if (Status == "完成") return $"{source}\n实测 {BitrateNumber(VerifiedVideo?.Mbps)}";
+            if (Action == "复制") return source + "\n原样复制";
+            if (Action is not ("压缩" or "待决定")) return source;
+            string label = PlannedRateMode == "恒定质量" ? "参考" : "目标";
+            return $"{source}\n{label} {BitrateNumber(TargetMbps)}";
+        }
+    }
+    static string BitrateNumber(double? mbps) => mbps is { } value && double.IsFinite(value) && value > 0
+        ? value < .01 ? "<0.01" : value.ToString("0.##")
+        : "—";
     [JsonIgnore] public bool PendingCompression => Action == "压缩" && Status is "待处理" or "已取消";
     [JsonIgnore] public string OutputSizeText => Status == "完成" ? Format.Bytes(OutputSize)
         : Status == "已跳过" || Action is "跳过" or "未处理" ? "—" : "预计 " + EstimateText;
