@@ -63,6 +63,8 @@ public sealed class MediaStream
     public string CodecTag { get; set; } = "";
     public string Profile { get; set; } = "";
     public string FrameRate { get; set; } = "";
+    public int Channels { get; set; }
+    public int SampleRate { get; set; }
     public double Mbps { get; set; }
     public byte[] ExtraData { get; set; } = [];
     public byte[] TimecodePacket { get; set; } = [];
@@ -149,6 +151,8 @@ public sealed class PlanItem : Observable
     public string TargetProfile { get; set; } = "";
     public string TargetCodec { get; set; } = "";
     public bool ConvertToTenBit420 { get; set; }
+    public bool MxfToMov { get; set; }
+    public string? MxfTimecode { get; set; }
     public double TargetFps { get; set; }
     public bool DropFrames { get; set; }
     public double? PlannedFpsLimit { get; set; }
@@ -178,11 +182,11 @@ public sealed class PlanItem : Observable
                 TargetDepth, "4:2:0", TargetMbps, TargetFps, Media?.Duration ?? 0, Media?.Vfr ?? false);
             var fpsText = DropFrames ? PlannedFpsLimit is { } cap ? $"峰值 ≤ {cap:0.###} fps" : "计划限帧" : null;
             var label = PlannedRateMode == "恒定质量" ? "计划 · 参考码率" : "计划 · 目标平均码率";
-            return $"{label} · {spec.Describe(fpsText)}{(RequiresReview ? "（待确认）" : "")}";
+            return $"{label} · {(MxfToMov ? "MOV · " : "")}{spec.Describe(fpsText)}{(RequiresReview ? "（待确认）" : "")}";
         }
     }
     [JsonIgnore] public string OutputSpec => Status != "完成" ? TargetSpec
-        : VerifiedVideo is { } result ? "已验证 · " + result.Describe()
+        : VerifiedVideo is { } result ? "已验证 · " + (MxfToMov ? (Action == "压缩" ? "MOV · " : "MXF · ") : "") + result.Describe()
         : Action == "复制" && Media != null ? "已验证 · " + SourceSpec
         : VideoCandidate || Media != null ? "成品规格未记录" : "已验证 · 原样保留";
     [JsonIgnore] public bool PendingCompression => Action == "压缩" && Status is "待处理" or "已取消";

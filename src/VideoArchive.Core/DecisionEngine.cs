@@ -44,14 +44,18 @@ public sealed class DecisionEngine
         if (!ignoreTimecode && TimecodeIssue(m) is { } issue) return issue;
         if (m.Streams.Count(x => x.Type == "video" && !x.AttachedPicture) != 1) return "包含多个视频画面轨道";
         if (m.Interlaced) return "隔行素材采用保守备份";
-        var convert420 = MediaPolicy.NeedsTenBit420(m);
+        bool mxf = MxfPolicy.IsInput(m);
+        var convert420 = MediaPolicy.NeedsTenBit420(m) || mxf &&
+            m.PixelFormat.StartsWith("yuv", StringComparison.Ordinal) &&
+            (m.Chroma is "4:2:2" or "4:4:4" or "4:4:0");
         if ((!convert420 && (m.BitDepth > 10 || m.PixelFormat.Contains("422") || m.PixelFormat.Contains("444"))) || m.PixelFormat.StartsWith("gbr") || m.PixelFormat.Contains("yuva")) return "特殊色度或透明通道需保留";
         if (m.SampleAspectRatio is not ("1:1" or "" or "N/A")) return "非方形像素素材采用保守备份";
         if (m.Hdr && (s.Codec == "H.264" || s.Depth == "8-bit") && !convert420) return "所选参数不能可靠保留HDR";
         if (m.Hdr && m.BitDepth < 10) return "HDR位深信息不一致，采用保守备份";
         if (m.BitDepth > 8 && s.Depth == "8-bit" && !convert420) return "避免降低源素材位深";
         var ext = Path.GetExtension(m.Path).ToLowerInvariant();
-        if (ext is not (".mp4" or ".mov" or ".mkv")) return "源容器的转码兼容性未验证";
+        if (mxf && MxfPolicy.Protection(m) is { } mxfProtection) return mxfProtection;
+        if (ext is not (".mp4" or ".mov" or ".mkv" or ".mxf")) return "源容器的转码兼容性未验证";
         if (ext is ".mp4" or ".mov")
         {
             if (m.Streams.Any(x => x.Type == "subtitle" && x.Codec != "mov_text")) return "源容器无法可靠保留字幕轨";
@@ -66,10 +70,12 @@ public sealed class DecisionEngine
         var relative = Path.GetRelativePath(sourceRoot, source);
         var p = new PlanItem { Source = source, RelativePath = relative, Destination = Path.Combine(outputRoot, relative), SourceSize = size, SourceModifiedUtc = modified, Media = m, EstimatedSize = size, Reason = m == null ? "配套资料原样备份" : "已满足目标规格" };
         if (m == null) return p;
-        p.ReviewIssue = TimecodeIssue(m) ?? "";
+        bool mxf = MxfPolicy.IsInput(m);
+        p.ReviewIssue = mxf ? "" : TimecodeIssue(m) ?? "";
         p.TimecodeChoice = p.ReviewIssue.Length > 0 ? timecodeChoice : "";
         p.ConvertToTenBit420 = MediaPolicy.NeedsTenBit420(m);
-        p.TargetCodec = p.ConvertToTenBit420 ? "HEVC" : s.Codec;
+        p.MxfToMov = mxf;
+        p.TargetCodec = mxf || p.ConvertToTenBit420 ? "HEVC" : s.Codec;
         s = MediaPolicy.EffectiveSettings(p, s);
         p.TargetWidth = m.Width; p.TargetHeight = m.Height; p.TargetFps = m.Fps; p.TargetDepth = p.ConvertToTenBit420 || s.Depth == "10-bit" ? 10 : m.BitDepth;
         p.TargetProfile = MediaPolicy.ResolveProfile(s, p.TargetDepth);
@@ -94,10 +100,10 @@ public sealed class DecisionEngine
             if (p.TimecodeChoice == "原样备份") { p.Reason = "用户选择原样备份：" + p.ReviewIssue; return p; }
             if (!p.DropTimecode) { p.Action = "待决定"; p.Reason = p.ReviewIssue + "；请选择原样备份或舍弃时间码后按方案压缩"; return p; }
         }
-        var protection = Protection(m, s, p.DropTimecode);
+        var protection = Protection(m, s, mxf || p.DropTimecode);
         if (protection != null) { p.Reason = protection + "，原样保留"; return p; }
         if (s.LimitFps && !m.CadenceChecked) { p.Reason = "无法可靠确认帧率上限，原样保留"; return p; }
-        var forced = p.ConvertToTenBit420 || downsize || p.DropFrames || s.Unified && SourceCodec(m.Codec) != s.Codec || s.Audio != "原样保留" && m.Streams.Any(x => x.Type == "audio");
+        var forced = !mxf && p.ConvertToTenBit420 || downsize || p.DropFrames || s.Unified && SourceCodec(m.Codec) != s.Codec || s.Audio != "原样保留" && m.Streams.Any(x => x.Type == "audio");
         if (m.VideoMbps <= 0) { p.Reason = "视频码率未知，避免无依据重编码"; return p; }
         var removedBytes = m.Streams.Where(MediaPolicy.IsDiscardedData).Sum(t => t.Mbps) * 1_000_000 / 8 * m.Duration;
         var audioBytes = Math.Max(0, m.Size - (m.VideoMbps * 1_000_000 / 8 * m.Duration) - removedBytes);
@@ -106,9 +112,27 @@ public sealed class DecisionEngine
         bool highRate = m.VideoMbps > requested * (1 + s.Tolerance / 100);
         if (!forced && (!highRate || savings < s.MinSavings))
         { p.Reason = highRate ? $"预计收益{ savings:0.#}%低于{ s.MinSavings:0.#}%" : $"已满足码率上限（容差{s.Tolerance:0.#}%）"; return p; }
+        if (mxf)
+        {
+            var timecode = MxfPolicy.PlanTimecode(m, p.DropFrames);
+            p.MxfTimecode = timecode.Timecode;
+            if (timecode.Issue is { } issue)
+            {
+                p.ReviewIssue = issue;
+                p.TimecodeChoice = timecodeChoice;
+                if (!p.DropTimecode)
+                {
+                    p.Action = timecodeChoice == "原样备份" ? "复制" : "待决定";
+                    p.Reason = timecodeChoice == "原样备份" ? "用户选择原样备份：" + issue : issue + "，请选择原样备份或舍弃时间码后压缩";
+                    return p;
+                }
+            }
+            p.Destination = Path.ChangeExtension(p.Destination, ".mov");
+        }
         p.Action = "压缩"; p.EstimatedSize = estimate;
         var reasons = new List<string>();
-        if (p.ConvertToTenBit420) reasons.Add($"{m.BitDepth}-bit {m.PixelFormat} 转为10-bit 4:2:0 HEVC Main10");
+        if (mxf) reasons.Add("MXF 转 MOV，视频为 HEVC Main10 10-bit 4:2:0，音轨原样保留");
+        else if (p.ConvertToTenBit420) reasons.Add($"{m.BitDepth}-bit {m.PixelFormat} 转为10-bit 4:2:0 HEVC Main10");
         if (downsize) reasons.Add("已启用最高1080P");
         if (p.DropFrames) reasons.Add($"帧率超过{s.FpsLimit:0.###}");
         if (highRate) reasons.Add("码率超过目标");
@@ -116,7 +140,7 @@ public sealed class DecisionEngine
         if (s.Audio != "原样保留") reasons.Add("音频转码");
         if (m.Streams.Any(MediaPolicy.IsDiscardedData)) reasons.Add("移除相机/特殊数据轨");
         if (p.DropTimecode) reasons.Add("用户选择舍弃时间码");
-        else if (m.Streams.Any(MediaPolicy.IsTimecode)) reasons.Add("保留tmcd及原计时规则");
+        else if (p.MxfTimecode != null || m.Streams.Any(MediaPolicy.IsTimecode)) reasons.Add("保留时间码及原计时规则");
         p.Reason = string.Join("、", reasons);
         return p;
     }

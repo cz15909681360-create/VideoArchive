@@ -106,6 +106,7 @@ public sealed class ProbeService(string ffprobe)
         foreach (var s in root.GetProperty("streams").EnumerateArray())
         {
             var stream = new MediaStream { Index = (int)Num(s, "index"), Type = Text(s, "codec_type"), Codec = Text(s, "codec_name"), CodecTag = Text(s, "codec_tag_string"), Profile = Text(s, "profile"), FrameRate = Text(s, "avg_frame_rate"), Mbps = Num(s, "bit_rate") / 1_000_000, Tags = Tags(s), AttachedPicture = s.TryGetProperty("disposition", out var disp) && Num(disp, "attached_pic") == 1 };
+            if (stream.Type == "audio") { stream.Channels = (int)Num(s, "channels"); stream.SampleRate = (int)Num(s, "sample_rate"); }
             if (MediaPolicy.IsTimecode(stream)) { stream.ExtraData = ParseExtraData(Text(s, "extradata")); stream.SampleCount = (long)Num(s, "nb_frames"); }
             info.Streams.Add(stream);
             if (stream.Type != "video" || stream.AttachedPicture || videoFound) continue;

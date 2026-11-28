@@ -63,6 +63,8 @@ public sealed class ScanService(ProbeService probe, Func<EncodeSettings, int, bo
             }
         }
         var items = new ConcurrentBag<PlanItem>(job.Items);
+        var occupied = OccupiedNames(job, files.Select(f => Path.GetRelativePath(job.SourceRoot, f.FullName))
+            .Concat(job.Items.Select(item => item.RelativePath)));
         int completed = 0, hits = 0, dirty = 0; var progressLock = new object(); long lastUpdate = -200;
         try
         {
@@ -74,7 +76,9 @@ public sealed class ScanService(ProbeService probe, Func<EncodeSettings, int, bo
                     MediaInfo? media = null; string? warning = null;
                     if (VideoExtensions.Contains(f.Extension))
                     {
-                        if (cache.TryGetValue(entry, out var previous) && previous.Size == f.Length && previous.ModifiedUtc == f.LastWriteTimeUtc && (!settings.LimitFps || previous.CadenceChecked))
+                        if (cache.TryGetValue(entry, out var previous) && previous.Size == f.Length && previous.ModifiedUtc == f.LastWriteTimeUtc &&
+                            (!settings.LimitFps || previous.CadenceChecked) &&
+                            (!MxfPolicy.IsInput(previous) || previous.Streams.All(s => s.Type != "audio" || s.SampleRate > 0 && s.Channels > 0)))
                         { media = previous; Interlocked.Increment(ref hits); }
                         else
                         {
@@ -87,9 +91,7 @@ public sealed class ScanService(ProbeService probe, Func<EncodeSettings, int, bo
                     var item = engine.Create(job.SourceRoot, job.OutputRoot, entry, f.Length, f.LastWriteTimeUtc, media, settings, choice);
                     item.VideoCandidate = VideoExtensions.Contains(f.Extension);
                     if (warning != null) item.Reason = warning;
-                    ProtectDepth(item, settings);
-                    if (File.Exists(item.Destination) && settings.Collision == "跳过") { item.Action = "跳过"; item.EstimatedSize = 0; item.Reason = "输出已存在，按规则跳过"; }
-                    item.PlannedAction = item.Action;
+                    FinalizePlan(job, item, settings, occupied);
                     items.Add(item);
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -120,16 +122,15 @@ public sealed class ScanService(ProbeService probe, Func<EncodeSettings, int, bo
         if (job.PlanVersion != MediaPolicy.PlanVersion) throw new InvalidOperationException("旧任务的探测信息需要更新，请重新扫描以使用新的数据轨规则。");
         if (RequiresCadenceRescan(job, settings)) throw new InvalidOperationException("开启限帧后需要重新扫描，以检测峰值帧率。");
         settings.Validate(); var engine = new DecisionEngine(); job.Settings = settings.Snapshot();
+        var occupied = OccupiedNames(job, job.Items.Select(item => item.RelativePath));
         job.Items = job.Items.Select(p =>
         {
             if (p.Action == "未处理") return p;
             var n = engine.Create(job.SourceRoot, job.OutputRoot, p.Source, p.SourceSize, p.SourceModifiedUtc, p.Media, settings, p.TimecodeChoice);
             n.ReviewSelected = p.ReviewSelected;
             n.VideoCandidate = p.VideoCandidate;
-            ProtectDepth(n, settings);
             if (p.Media == null && p.Reason.StartsWith("媒体探测失败")) n.Reason = p.Reason;
-            if (File.Exists(n.Destination) && settings.Collision == "跳过") { n.Action = "跳过"; n.EstimatedSize = 0; n.Reason = "输出已存在，按规则跳过"; }
-            n.PlannedAction = n.Action;
+            FinalizePlan(job, n, settings, occupied);
             return n;
         }).ToList();
     }
@@ -142,9 +143,34 @@ public sealed class ScanService(ProbeService probe, Func<EncodeSettings, int, bo
         foreach (var item in items.Where(i => job.Items.Contains(i) && i.CanReview)) item.TimecodeChoice = choice;
         Replan(job, job.Settings);
     }
-    void ProtectDepth(PlanItem item, EncodeSettings settings)
+    static HashSet<string> OccupiedNames(ArchiveJob job, IEnumerable<string> files) =>
+        job.Directories.Concat(files).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    void FinalizePlan(ArchiveJob job, PlanItem item, EncodeSettings settings, HashSet<string> occupied)
     {
-        if (item.Action != "压缩" || depthSupported == null || depthSupported(MediaPolicy.EffectiveSettings(item, settings), item.TargetDepth)) return;
-        item.Action = "复制"; item.Reason = "当前编码组合不支持源位深，原样保留"; item.EstimatedSize = item.SourceSize;
+        bool mxfCandidate = item.MxfToMov && item.Action is ("压缩" or "待决定");
+        if (mxfCandidate && occupied.Contains(Path.ChangeExtension(item.RelativePath, ".mov")))
+            CopyInstead("同一任务存在同名 MOV 路径，MXF 原样保留");
+        else if ((item.Action == "压缩" || mxfCandidate) && depthSupported != null &&
+            !depthSupported(MediaPolicy.EffectiveSettings(item, settings), item.TargetDepth))
+            CopyInstead(item.MxfToMov ? "当前编码设备不支持 HEVC Main10，MXF 原样保留" : "当前编码组合不支持源位深，原样保留");
+        if (!(item.MxfToMov && item.RequiresReview) && File.Exists(item.Destination) && settings.Collision == "跳过")
+        {
+            item.Action = "跳过";
+            item.EstimatedSize = 0;
+            item.Reason = "输出已存在，按规则跳过";
+        }
+        item.PlannedAction = item.Action;
+
+        void CopyInstead(string reason)
+        {
+            item.Action = "复制";
+            item.Reason = reason;
+            item.EstimatedSize = item.SourceSize;
+            if (!item.MxfToMov) return;
+            item.Destination = Path.Combine(job.OutputRoot, item.RelativePath);
+            item.ReviewIssue = "";
+            item.TimecodeChoice = "";
+        }
     }
 }

@@ -46,14 +46,14 @@ dotnet run --project src/VideoArchive -c Release
 打包脚本当前按Gyan.dev FFmpeg 8.1.1安装布局收集许可证、发行版README和对应源码归档，要求FFmpeg/FFprobe位于同一发行版的`bin`目录。使用其他发行版时，应先调整第三方资料收集与版本，而不是仅替换文件名。
 
 ```powershell
-./build.ps1 -Test -Package -SingleExe -ReleaseName VideoArchive-v1.3.2-win-x64
+./build.ps1 -Test -Package -SingleExe -ReleaseName VideoArchive-v1.3.3-win-x64
 ```
 
 输出位于`artifacts/`：
 
-- `VideoArchive-v1.3.2-win-x64.exe`：可直接运行的单文件版，内含 FFmpeg、FFprobe 及对应的许可资料。
-- `VideoArchive-v1.3.2-win-x64/`及同名 ZIP：Windows x64自包含程序、运行时、`tools/`、`licenses/`和说明文档。
-- `VideoArchive-source.zip`：脚本生成的源码包。GitHub 发行版的源码包命名为 `VideoArchive-v1.3.2-source.zip`，包含源码、测试、构建脚本、文档及仓库配置，不含SDK、构建中间文件和用户数据。
+- `VideoArchive-v1.3.3-win-x64.exe`：可直接运行的单文件版，内含 FFmpeg、FFprobe 及对应的许可资料。
+- `VideoArchive-v1.3.3-win-x64/`及同名 ZIP：Windows x64自包含程序、运行时、`tools/`、`licenses/`和说明文档。
+- `VideoArchive-source.zip`：脚本生成的源码包。GitHub 发行版的源码包命名为 `VideoArchive-v1.3.3-source.zip`，包含源码、测试、构建脚本、文档及仓库配置，不含SDK、构建中间文件和用户数据。
 
 程序源码MIT许可证与第三方组件许可证分别适用；发布包需保留第三方资料。详情见[第三方声明](../THIRD-PARTY-NOTICES.md)。当前程序未签名。
 

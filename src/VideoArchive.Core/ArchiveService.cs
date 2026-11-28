@@ -45,7 +45,13 @@ public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDir
         job.Settings.Validate(); Files.ValidateRoots(job.SourceRoot, job.OutputRoot);
         if (job.Items.Any(i => i.Media != null) && job.PlanVersion != MediaPolicy.PlanVersion) throw new InvalidOperationException("旧任务需要重新扫描，才能使用当前时间码与Main10规则。");
         if (job.Items.Any(i => i.RequiresReview)) throw new InvalidOperationException("存在时间码待决定文件，请逐个或批量选择处理方式后开始备份。");
-        Continue(); reservedNames.Clear(); foreach (var p in job.Items) reservedNames.Add(p.Destination);
+        Continue(); reservedNames.Clear();
+        foreach (var item in job.Items)
+        {
+            reservedNames.Add(item.Destination);
+            if (item.MxfToMov && item.Action == "压缩")
+                reservedNames.Add(Path.Combine(job.OutputRoot, item.RelativePath));
+        }
         job.State = "执行中"; job.Finished = null; Save(job);
         foreach (var directory in job.Directories)
         {
@@ -101,24 +107,12 @@ public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDir
         await using var sourceLock = new FileStream(p.Source, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, true);
         var source = new FileInfo(p.Source);
         if (source.Length != p.SourceSize || source.LastWriteTimeUtc != p.SourceModifiedUtc) throw new IOException("源文件自扫描后已变化，请重新扫描。");
-        lock (nameLock)
-        {
-            if (File.Exists(p.Destination))
-            {
-                if (job.Settings.Collision == "跳过") { p.Status = "已跳过"; p.Progress = 100; p.Detail = "输出已存在"; return; }
-                if (job.Settings.Collision == "自动重命名")
-                {
-                    var directory = Path.GetDirectoryName(p.Destination)!; var stem = Path.GetFileNameWithoutExtension(p.Destination); var ext = Path.GetExtension(p.Destination); int suffix = 1; string candidate;
-                    do { candidate = Path.Combine(directory, $"{stem} ({suffix++}){ext}"); } while (File.Exists(candidate) || reservedNames.Contains(candidate));
-                    p.Destination = candidate; reservedNames.Add(candidate);
-                }
-            }
-        }
+        if (!ResolveExistingDestination(p, job.Settings.Collision)) return;
         Directory.CreateDirectory(Path.GetDirectoryName(p.Destination)!);
         var necessary = Math.Max(p.EstimatedSize, Math.Min(p.SourceSize, 64 * 1024 * 1024));
         var free = (availableSpace ?? Files.FreeSpace)(p.Destination);
         if (free < necessary + 16 * 1024 * 1024) throw new IOException("输出磁盘可用空间不足。");
-        var temp = Path.Combine(Path.GetDirectoryName(p.Destination)!, ".va-" + Guid.NewGuid().ToString("N") + ".partial" + Path.GetExtension(p.Destination));
+        var temp = TemporaryOutput(p.Destination);
         p.Detail = "";
         p.PlannedAction = p.PlannedAction.Length == 0 ? p.Action : p.PlannedAction;
         VideoSpecification? verified = null;
@@ -158,7 +152,7 @@ public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDir
                         await verification.WaitAsync(ct);
                         verifySlotHeld = true;
                     }
-                    if (!p.DropTimecode) MediaPolicy.RestoreTimecodeDescriptions(temp, p.Media!);
+                    if (!p.MxfToMov && !p.DropTimecode) MediaPolicy.RestoreTimecodeDescriptions(temp, p.Media!);
                     p.Status = "验证中"; p.Detail = "检查规格、轨道和完整解码"; Changed?.Invoke(p, p.Detail);
                     try
                     {
@@ -166,14 +160,23 @@ public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDir
                         verified = result.Spec;
                         return result.Error;
                     }
-                    catch (IOException ex) when (hardware) { return ex.Message; }
+                    catch (IOException ex) when (hardware || p.MxfToMov) { return ex.Message; }
                 }
                 if (validation != null || new FileInfo(temp).Length > p.SourceSize)
                 {
                     File.Delete(temp); sourceLock.Position = 0;
-                    await CopyAsync(sourceLock, temp, p, ct);
                     p.Detail = "改为原样保留：" + (validation ?? "成品大于原文件");
                     p.Action = "复制"; p.Reason += "；" + p.Detail;
+                    if (p.MxfToMov)
+                    {
+                        p.Destination = Path.Combine(job.OutputRoot, p.RelativePath);
+                        Files.CheckDestination(job.OutputRoot, p.Destination);
+                        if (!ResolveExistingDestination(p, job.Settings.Collision)) return;
+                        var available = (availableSpace ?? Files.FreeSpace)(p.Destination);
+                        if (available < p.SourceSize + 16 * 1024 * 1024) throw new IOException("原样备份所需磁盘空间不足。");
+                        temp = TemporaryOutput(p.Destination);
+                    }
+                    await CopyAsync(sourceLock, temp, p, ct);
                 }
                 p.Progress = 96;
             }
@@ -200,6 +203,35 @@ public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDir
         {
             if (verifySlotHeld) verification!.Release();
             if (File.Exists(temp)) File.Delete(temp);
+        }
+    }
+
+    static string TemporaryOutput(string destination) => Path.Combine(Path.GetDirectoryName(destination)!,
+        ".va-" + Guid.NewGuid().ToString("N") + ".partial" + Path.GetExtension(destination));
+
+    bool ResolveExistingDestination(PlanItem item, string collision)
+    {
+        lock (nameLock)
+        {
+            if (!File.Exists(item.Destination)) return true;
+            if (collision == "跳过")
+            {
+                item.Status = "已跳过";
+                item.Progress = 100;
+                item.Detail = "输出已存在";
+                return false;
+            }
+            if (collision != "自动重命名") return true;
+            var directory = Path.GetDirectoryName(item.Destination)!;
+            var stem = Path.GetFileNameWithoutExtension(item.Destination);
+            var extension = Path.GetExtension(item.Destination);
+            int suffix = 1;
+            string candidate;
+            do { candidate = Path.Combine(directory, $"{stem} ({suffix++}){extension}"); }
+            while (File.Exists(candidate) || Directory.Exists(candidate) || reservedNames.Contains(candidate));
+            reservedNames.Add(candidate);
+            item.Destination = candidate;
+            return true;
         }
     }
 
@@ -259,6 +291,13 @@ public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDir
 
     static string? ValidateOutput(PlanItem item, EncodeSettings settings, MediaInfo source, MediaInfo actual)
     {
+        if (item.MxfToMov)
+        {
+            if (!actual.Container.Split(',').Contains("mov") || actual.Tags.GetValueOrDefault("major_brand")?.Trim() != "qt")
+                return "输出容器不是 MOV";
+            if (actual.PixelFormat != "yuv420p10le" || actual.Codec != "hevc")
+                return "MXF 成品不是 10-bit 4:2:0 HEVC";
+        }
         if (actual.Width != item.TargetWidth || actual.Height != item.TargetHeight) return "输出尺寸不符";
         if (actual.Codec != (settings.Codec == "H.264" ? "h264" : settings.Codec == "HEVC" ? "hevc" : "av1")) return "输出编码不符";
         if ((!item.ConvertToTenBit420 && actual.BitDepth < source.BitDepth) || actual.BitDepth != item.TargetDepth) return "输出位深不符";
@@ -271,19 +310,28 @@ public sealed class ArchiveService(string ffmpeg, string ffprobe, string dataDir
         if (source.VideoMbps > 0 && actual.VideoMbps > source.VideoMbps + .000001) return "输出平均码率高于源视频";
         if (Math.Abs(actual.Rotation - source.Rotation) % 360 != 0) return "旋转信息未保留";
         var expected = MediaPolicy.MappedStreams(source, item.DropTimecode);
-        if (actual.Streams.Count != expected.Count || actual.Chapters != source.Chapters) return "应保留的轨道或章节不符";
+        var actualStreams = item.MxfToMov ? actual.Streams.Where(stream => !MediaPolicy.IsTimecode(stream)).ToList() : actual.Streams;
+        if (item.MxfToMov && !MxfPolicy.VerifyTimecode(item, actual)) return "MXF 时间码未按计划写入 MOV";
+        if (actualStreams.Count != expected.Count || actual.Chapters != source.Chapters) return "应保留的轨道或章节不符";
         if (actual.Streams.Any(MediaPolicy.IsDiscardedData)) return "输出仍包含应移除的特殊数据轨";
         for (int i = 0; i < expected.Count; i++)
         {
-            var a = expected[i]; var b = actual.Streams[i];
+            var a = expected[i]; var b = actualStreams[i];
             if (a.Type != b.Type || a.AttachedPicture != b.AttachedPicture) return "轨道类型不符";
             if (a.Index != source.VideoIndex && !(a.Type == "audio" && settings.Audio != "原样保留") && a.Codec != b.Codec) return "非目标轨道被改变";
+            if (item.MxfToMov)
+            {
+                if (a.Type == "audio" && (a.Channels != b.Channels || a.SampleRate != b.SampleRate))
+                    return "MXF 音轨声道数或采样率未保留";
+                continue;
+            }
             if (MediaPolicy.IsTimecode(a) && (!MediaPolicy.IsTimecode(b) || b.ExtraData.Length < 20 || !a.ExtraData.AsSpan(0, 20).SequenceEqual(b.ExtraData.AsSpan(0, 20)))) return "时间码标志或计时规则未保留";
             if (MediaPolicy.RegenerateTimecode(source) && MediaPolicy.IsTimecode(a) && !a.TimecodePacket.SequenceEqual(b.TimecodePacket)) return "原时间码计数未保留";
             foreach (var tag in a.Tags.Where(t => ImportantTag(t.Key) && !(item.DropTimecode && t.Key.Equals("timecode", StringComparison.OrdinalIgnoreCase))))
                 if (!PreservedTag(tag, b.Tags)) return "轨道元数据未可靠保留：" + tag.Key;
         }
-        foreach (var tag in source.Tags.Where(t => ImportantTag(t.Key)))
+        // MXF package metadata has no equivalent object structure in MOV.
+        foreach (var tag in source.Tags.Where(t => !item.MxfToMov && ImportantTag(t.Key)))
         {
             if (item.DropTimecode && tag.Key.Equals("timecode", StringComparison.OrdinalIgnoreCase)) continue;
             // Some camera files repeat the timecode as a global mdta tag. With

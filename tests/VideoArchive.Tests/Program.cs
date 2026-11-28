@@ -482,4 +482,5 @@ if (args.Contains("--camera-check"))
     }
     Console.WriteLine("CAMERA_ARTIFACTS=" + root);
 }
+if (args.Contains("--integration") || args.Contains("--mxf-check")) await MxfChecks.RunAsync(Check);
 Console.WriteLine($"ALL {checks} CHECKS PASSED");

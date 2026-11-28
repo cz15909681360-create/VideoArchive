@@ -21,8 +21,16 @@ public static class MediaPolicy
         (media.PixelFormat.Contains("422") || media.PixelFormat.Contains("444") || media.PixelFormat.Contains("440") || media.BitDepth > 10 && media.PixelFormat.StartsWith("yuv"));
     public static EncodeSettings EffectiveSettings(PlanItem item, EncodeSettings settings)
     {
-        if (item.TargetCodec.Length == 0 || item.TargetCodec == settings.Codec) return settings;
-        var effective = settings.Snapshot(); effective.Codec = item.TargetCodec; effective.Profile = "自动"; effective.EncoderPreset = "自动";
+        var changeCodec = item.TargetCodec.Length > 0 && item.TargetCodec != settings.Codec;
+        if (!changeCodec && !item.MxfToMov) return settings;
+        var effective = settings.Snapshot();
+        if (changeCodec)
+        {
+            effective.Codec = item.TargetCodec;
+            effective.Profile = "自动";
+            effective.EncoderPreset = "自动";
+        }
+        if (item.MxfToMov) { effective.Depth = "10-bit"; effective.Audio = "原样保留"; }
         return effective;
     }
 

@@ -23,7 +23,7 @@ public static class CommandBuilder
         foreach (var stream in streams) Add("-map", "0:" + stream.Index);
         Add("-map_metadata", "0"); Add("-map_chapters", "0"); Add("-c", "copy");
         for (int i = 0; i < streams.Count; i++) Add("-map_metadata:s:" + i, "0:s:" + streams[i].Index);
-        if (item.DropTimecode)
+        if (item.DropTimecode || item.MxfToMov)
         {
             Add("-metadata", "timecode=");
             for (int i = 0; i < streams.Count; i++) Add("-metadata:s:" + i, "timecode=");
@@ -86,10 +86,12 @@ public static class CommandBuilder
             // MP4 cover images live in ilst; use_metadata_tags selects mdta and
             // silently omits those images. Keep ilst for camera thumbnails.
             Add("-movflags", m.Streams.Any(t => t.AttachedPicture) ? "+faststart" : "+faststart+use_metadata_tags");
-            Add("-write_tmcd", !item.DropTimecode && m.Streams.Any(MediaPolicy.IsTimecode) ? "1" : "0");
+            bool hasTimecode = item.MxfToMov ? item.MxfTimecode != null : m.Streams.Any(MediaPolicy.IsTimecode);
+            Add("-write_tmcd", !item.DropTimecode && hasTimecode ? "1" : "0");
             // MP4 refuses mapped codec-none tmcd streams. Let the muxer allocate
             // a valid track, then restore the source description and counter.
-            if (!item.DropTimecode && MediaPolicy.RegenerateTimecode(m)) Add("-timecode", m.Streams.Single(MediaPolicy.IsTimecode).Tags["timecode"]);
+            if (!item.DropTimecode && item.MxfTimecode is { } timecode) Add("-timecode", timecode);
+            else if (!item.DropTimecode && MediaPolicy.RegenerateTimecode(m)) Add("-timecode", m.Streams.Single(MediaPolicy.IsTimecode).Tags["timecode"]);
             if (s.Codec == "HEVC") Add("-tag" + spec, "hvc1");
         }
         Add("-progress", "pipe:1"); args.Add("-nostats"); args.Add(temporaryOutput);

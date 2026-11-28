@@ -4,7 +4,7 @@ Windows 11 原生桌面程序，使用 FFmpeg 压缩视频素材库，保留分�
 
 [![Windows build](https://github.com/cz15909681360-create/VideoArchive/actions/workflows/build.yml/badge.svg)](https://github.com/cz15909681360-create/VideoArchive/actions/workflows/build.yml)
 
-**当前版本：1.3.2 · Windows x64 · C# / WPF / .NET 10**
+**当前版本：1.3.3 · Windows x64 · C# / WPF / .NET 10**
 
 [下载单文件 EXE 或便携 ZIP](https://github.com/cz15909681360-create/VideoArchive/releases/latest) · [使用与常见问题](docs/USER-GUIDE.md) · [架构与决策规则](docs/ARCHITECTURE.md) · [构建与发布](docs/BUILDING.md) · [更新记录](CHANGELOG.md)
 
@@ -65,7 +65,9 @@ Windows 11 x64 单文件版可直接双击运行。程序内置 .NET/WPF、FFmpe
 
 舍弃时间码只解除时间码保护，仍按当前压缩方案处理。静态 HDR10 / HLG 需要保留色彩及必要 HDR 元数据，否则原样复制。Dolby Vision、HDR10+、多画面轨、透明/隔行素材及未验证容器组合仍采取保守原样备份，并显示对应原因。
 
-主转码容器验证覆盖 MP4、MOV、MKV；其他视频容器仍纳入扫描和目录镜像，默认原样备份。复制结果校验大小与 SHA-256；转码结果检查尺寸、编码、位深、时长、帧率、轨道、章节、重要元数据并完整解码。若完整解码发现错误，则标记失败。源文件自扫描后改变会拒绝处理，需重新扫描。
+主转码容器覆盖 MP4、MOV 和 MKV。独立的 MXF OP1a 素材在满足压缩条件时输出 MOV，视频为 HEVC Main10、10-bit 4:2:0，音轨原样保留，可验证的时间码写入 MOV。其他未验证的组合原样备份。
+
+复制结果校验大小与 SHA-256。转码结果检查尺寸、编码、位深、时长、帧率及应保留的轨道，并完整解码。MXF 成品超过原文件大小或保留校验失败时，回退为原 .mxf 并记录原因。源文件自扫描后改变时需重新扫描。
 
 照片、字幕、工程等非视频文件完整复制。目录联接和符号链接不跟随，报告会列出未处理项。预设、任务历史和探测缓存在 `%LOCALAPPDATA%\VideoArchive`。旧任务若需采用新数据轨规则，应重新扫描；已完成的旧备份不会自动改写。暂停队列会让当前文件完成；取消会终止正在编码的进程并清理临时文件。运行中关闭窗口会先取消，待停止后再关闭。
 
